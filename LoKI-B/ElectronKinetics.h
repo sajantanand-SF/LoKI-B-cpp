@@ -257,11 +257,15 @@ private:
      *  damped: eedf <- (1 - eeMixingParameter) * guess + eeMixingParameter * solution, converged when
      *  solution and guess agree (maxEedfRelError) and the e-e power vanishes; capped at eeMaxIterations
      *  for every growth model, with the usual "did not converge" warning.
+     *  anderson: Anderson acceleration on ln(eedf) with history depth eeAndersonDepth (default 5) and step
+     *  damping eeMixingParameter; same convergence test and cap as damped; the history is cleared (plain damped
+     *  step) when the residual grows by more than a factor 2.
      */
-    enum class EEUpdate { secant, damped };
+    enum class EEUpdate { secant, damped, anderson };
     EEUpdate eeUpdate = EEUpdate::secant;
     double eeMixingParameter = 0.3;
     uint32_t eeMaxIterations = 1000;
+    uint32_t eeAndersonDepth = 5;
 
 };
 

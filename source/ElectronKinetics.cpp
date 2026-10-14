@@ -29,6 +29,7 @@
  */
 
 #include <cstdlib>
+#include <vector>
 #include "LoKI-B/ElectronKinetics.h"
 #include "LoKI-B/Constant.h"
 #include "LoKI-B/EedfUtilities.h"
@@ -102,13 +103,17 @@ ElectronKineticsBoltzmann::ElectronKineticsBoltzmann(const std::filesystem::path
             const std::string u = nl.at("eeUpdate").get<std::string>();
             if (u == "damped")
                 eeUpdate = EEUpdate::damped;
+            else if (u == "anderson")
+                eeUpdate = EEUpdate::anderson;
             else if (u != "secant")
-                throw std::runtime_error("eeUpdate must be 'secant' or 'damped', not '" + u + "'.");
+                throw std::runtime_error("eeUpdate must be 'secant', 'damped' or 'anderson', not '" + u + "'.");
         }
         if (nl.contains("eeMixingParameter"))
             eeMixingParameter = nl.at("eeMixingParameter").get<double>();
         if (nl.contains("eeMaxIterations"))
             eeMaxIterations = nl.at("eeMaxIterations").get<uint32_t>();
+        if (nl.contains("eeAndersonDepth"))
+            eeAndersonDepth = nl.at("eeAndersonDepth").get<uint32_t>();
         if (!(eeMixingParameter > 0. && eeMixingParameter <= 1.))
             throw std::runtime_error("eeMixingParameter must be in (0, 1].");
     }
@@ -784,6 +789,11 @@ void ElectronKineticsBoltzmann::solveEEColl()
     Vector eedfNew = eedf;
     Vector eedfGuess = eedf; // damped update: the EEDF the e-e coefficients are built from
     double guessDiff = 0.;
+    // Anderson acceleration state (on x = ln eedf): last x and residual, and histories of their differences
+    std::vector<Vector> andersonDX, andersonDR;
+    Vector andersonXLast, andersonRLast;
+    bool andersonHaveLast = false;
+    uint32_t andersonRestarts = 0;
 
     bool hasConverged = false;
     uint32_t iter = 0;
@@ -812,7 +822,7 @@ void ElectronKineticsBoltzmann::solveEEColl()
 
         const double ratio = std::abs(power.electronElectronNet / power.reference);
 
-        if (eeUpdate == EEUpdate::damped)
+        if (eeUpdate != EEUpdate::secant)
         {
             // fixed point: the solution equals the guess the e-e coefficients were built from
             guessDiff = maxRelDiff(eedfGuess, eedf);
@@ -850,10 +860,66 @@ void ElectronKineticsBoltzmann::solveEEColl()
                 hasConverged = true;
                 Log<Message>::Warning("Electron-electron iterative scheme did not converge.");
             }
-            if (!hasConverged)
+            if (!hasConverged && eeUpdate == EEUpdate::damped)
             {
                 // convex combination of two normalized EEDFs: stays normalized and non-negative
                 eedf = (1. - eeMixingParameter) * eedfGuess + eeMixingParameter * eedf;
+            }
+            else if (!hasConverged)
+            {
+                // Anderson acceleration on x = ln(eedf): keeps the EEDF positive, weights cells by relative change
+                const double tiny = 1e-300;
+                const Vector x = eedfGuess.cwiseMax(tiny).array().log().matrix();
+                const Vector r = eedf.cwiseMax(tiny).array().log().matrix() - x;
+                if (andersonHaveLast)
+                {
+                    if (r.norm() > 2. * andersonRLast.norm())
+                    {
+                        // residual grew: restart the history
+                        andersonDX.clear();
+                        andersonDR.clear();
+                        ++andersonRestarts;
+                    }
+                    else
+                    {
+                        andersonDX.push_back(x - andersonXLast);
+                        andersonDR.push_back(r - andersonRLast);
+                        if (andersonDX.size() > eeAndersonDepth)
+                        {
+                            andersonDX.erase(andersonDX.begin());
+                            andersonDR.erase(andersonDR.begin());
+                        }
+                    }
+                }
+                andersonXLast = x;
+                andersonRLast = r;
+                andersonHaveLast = true;
+
+                Vector xNew = x + eeMixingParameter * r;
+                if (!andersonDR.empty())
+                {
+                    const Eigen::Index m = static_cast<Eigen::Index>(andersonDR.size());
+                    Matrix DR(x.size(), m), DX(x.size(), m);
+                    for (Eigen::Index j = 0; j < m; ++j)
+                    {
+                        DR.col(j) = andersonDR[static_cast<size_t>(j)];
+                        DX.col(j) = andersonDX[static_cast<size_t>(j)];
+                    }
+                    const Vector gamma = DR.colPivHouseholderQr().solve(r);
+                    if (gamma.allFinite())
+                    {
+                        xNew = x - DX * gamma + eeMixingParameter * (r - DR * gamma);
+                    }
+                    else
+                    {
+                        andersonDX.clear();
+                        andersonDR.clear();
+                        ++andersonRestarts;
+                    }
+                }
+                xNew.array() -= xNew.maxCoeff(); // avoid overflow; normalization restores the scale
+                eedf = xNew.array().exp().matrix();
+                normalizeEDF(eedf, grid());
             }
             iter++;
             continue;
@@ -902,10 +968,11 @@ void ElectronKineticsBoltzmann::solveEEColl()
     }
 
     std::cerr << "e-e routine converged in: " << iter << " iterations.\n";
-    if (eeUpdate == EEUpdate::damped)
+    if (eeUpdate != EEUpdate::secant)
     {
-        std::cerr << "e-e damped update: final max relative change " << guessDiff << ", e-e power ratio "
-                  << std::abs(power.electronElectronNet / power.reference) << "\n";
+        std::cerr << "e-e " << (eeUpdate == EEUpdate::damped ? "damped" : "anderson")
+                  << " update: final max relative change " << guessDiff << ", e-e power ratio "
+                  << std::abs(power.electronElectronNet / power.reference) << (eeUpdate == EEUpdate::anderson ? ", restarts " + std::to_string(andersonRestarts) : std::string()) << "\n";
     }
 }
 
