@@ -251,6 +251,18 @@ private:
     double maxEedfRelError;
     double maxPowerBalanceRelError;
 
+    /** e-e iteration update (solveEEColl), set by the optional keys
+     *  numerics.nonLinearRoutines.{eeUpdate, eeMixingParameter, eeMaxIterations}.
+     *  secant (default): the original extrapolation; it has no iteration cap when a growth model is on.
+     *  damped: eedf <- (1 - eeMixingParameter) * guess + eeMixingParameter * solution, converged when
+     *  solution and guess agree (maxEedfRelError) and the e-e power vanishes; capped at eeMaxIterations
+     *  for every growth model, with the usual "did not converge" warning.
+     */
+    enum class EEUpdate { secant, damped };
+    EEUpdate eeUpdate = EEUpdate::secant;
+    double eeMixingParameter = 0.3;
+    uint32_t eeMaxIterations = 1000;
+
 };
 
 class ElectronKineticsPrescribed : public ElectronKinetics

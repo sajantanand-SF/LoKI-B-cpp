@@ -28,6 +28,7 @@
  *  \date   13 July 2023
  */
 
+#include <cstdlib>
 #include "LoKI-B/ElectronKinetics.h"
 #include "LoKI-B/Constant.h"
 #include "LoKI-B/EedfUtilities.h"
@@ -94,6 +95,23 @@ ElectronKineticsBoltzmann::ElectronKineticsBoltzmann(const std::filesystem::path
     maxEedfRelError(cnf.at("numerics").at("nonLinearRoutines").at("maxEedfRelError")),
     maxPowerBalanceRelError(cnf.at("numerics").at("maxPowerBalanceRelError"))
 {
+    {
+        const auto& nl = cnf.at("numerics").at("nonLinearRoutines");
+        if (nl.contains("eeUpdate"))
+        {
+            const std::string u = nl.at("eeUpdate").get<std::string>();
+            if (u == "damped")
+                eeUpdate = EEUpdate::damped;
+            else if (u != "secant")
+                throw std::runtime_error("eeUpdate must be 'secant' or 'damped', not '" + u + "'.");
+        }
+        if (nl.contains("eeMixingParameter"))
+            eeMixingParameter = nl.at("eeMixingParameter").get<double>();
+        if (nl.contains("eeMaxIterations"))
+            eeMaxIterations = nl.at("eeMaxIterations").get<uint32_t>();
+        if (!(eeMixingParameter > 0. && eeMixingParameter <= 1.))
+            throw std::runtime_error("eeMixingParameter must be in (0, 1].");
+    }
     if (growthModelType == GrowthModelType::spatial && workingConditions->reducedExcFreqSI()!=0.0)
     {
         throw std::runtime_error("The excitation frequency must be zero when "
@@ -764,12 +782,15 @@ void ElectronKineticsBoltzmann::solveEEColl()
 
     double ratioNew = 0.;
     Vector eedfNew = eedf;
+    Vector eedfGuess = eedf; // damped update: the EEDF the e-e coefficients are built from
+    double guessDiff = 0.;
 
     bool hasConverged = false;
     uint32_t iter = 0;
 
     while (!hasConverged)
     {
+        eedfGuess = eedf;
         eeOperator->update_g_ee_AB(grid(),eedf,ne,n0);
         // restore boltzmannMatrix to the situation without ee collisions
         for (Grid::Index k = 0; k < grid().nCells(); ++k)
@@ -790,6 +811,53 @@ void ElectronKineticsBoltzmann::solveEEColl()
         evaluatePower();
 
         const double ratio = std::abs(power.electronElectronNet / power.reference);
+
+        if (eeUpdate == EEUpdate::damped)
+        {
+            // fixed point: the solution equals the guess the e-e coefficients were built from
+            guessDiff = maxRelDiff(eedfGuess, eedf);
+            static const bool eeDebug = std::getenv("LOKIB_EE_DEBUG") != nullptr;
+            if (eeDebug)
+            {
+                // per-iteration diagnostics (environment variable LOKIB_EE_DEBUG set)
+                Grid::Index iMax = 0;
+                double rMax = -1., l1 = 0., meanGuess = 0., meanNew = 0.;
+                for (Grid::Index k = 0; k < grid().nCells(); ++k)
+                {
+                    const double ref = (std::abs(eedfGuess[k]) + std::abs(eedf[k])) / 2;
+                    const double rk = ref != 0 ? std::abs(eedf[k] - eedfGuess[k]) / ref : 0.;
+                    if (rk > rMax) { rMax = rk; iMax = k; }
+                    const double w = std::sqrt(grid().getCell(k)) * grid().duCell(k);
+                    l1 += std::abs(eedf[k] - eedfGuess[k]) * w;
+                    meanGuess += eedfGuess[k] * grid().getCell(k) * w;
+                    meanNew += eedf[k] * grid().getCell(k) * w;
+                }
+                std::cerr << "ee-debug iter " << iter << " maxRel " << rMax << " at " << grid().getCell(iMax)
+                          << " eV (f0 " << eedf[iMax] << ") L1 " << l1 << " ratio " << ratio
+                          << " meanGuess " << meanGuess << " meanNew " << meanNew << "\n";
+            }
+            if (guessDiff < maxEedfRelError && ratio < 1.e-9)
+            {
+                hasConverged = true;
+            }
+            else if (guessDiff < maxEedfRelError && iter > 200)
+            {
+                Log<PowerRatioError>::Warning(ratio);
+                hasConverged = true;
+            }
+            else if (iter + 1 >= eeMaxIterations)
+            {
+                hasConverged = true;
+                Log<Message>::Warning("Electron-electron iterative scheme did not converge.");
+            }
+            if (!hasConverged)
+            {
+                // convex combination of two normalized EEDFs: stays normalized and non-negative
+                eedf = (1. - eeMixingParameter) * eedfGuess + eeMixingParameter * eedf;
+            }
+            iter++;
+            continue;
+        }
 
         if (maxRelDiff(eedfNew,eedf) < maxEedfRelError)
         {
@@ -834,6 +902,11 @@ void ElectronKineticsBoltzmann::solveEEColl()
     }
 
     std::cerr << "e-e routine converged in: " << iter << " iterations.\n";
+    if (eeUpdate == EEUpdate::damped)
+    {
+        std::cerr << "e-e damped update: final max relative change " << guessDiff << ", e-e power ratio "
+                  << std::abs(power.electronElectronNet / power.reference) << "\n";
+    }
 }
 
 void ElectronKineticsBoltzmann::obtainTimeIndependentSolution()
