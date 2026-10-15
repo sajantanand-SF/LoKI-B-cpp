@@ -114,6 +114,12 @@ ElectronKineticsBoltzmann::ElectronKineticsBoltzmann(const std::filesystem::path
             eeMaxIterations = nl.at("eeMaxIterations").get<uint32_t>();
         if (nl.contains("eeAndersonDepth"))
             eeAndersonDepth = nl.at("eeAndersonDepth").get<uint32_t>();
+        if (nl.contains("eeAndersonRestartFactor"))
+            eeAndersonRestartFactor = nl.at("eeAndersonRestartFactor").get<double>();
+        if (nl.contains("eeAndersonWeighted"))
+            eeAndersonWeighted = nl.at("eeAndersonWeighted").get<bool>();
+        if (nl.contains("eeInnerTolFactor"))
+            eeInnerTolFactor = nl.at("eeInnerTolFactor").get<double>();
         if (!(eeMixingParameter > 0. && eeMixingParameter <= 1.))
             throw std::runtime_error("eeMixingParameter must be in (0, 1].");
     }
@@ -792,6 +798,7 @@ void ElectronKineticsBoltzmann::solveEEColl()
     // Anderson acceleration state (on x = ln eedf): last x and residual, and histories of their differences
     std::vector<Vector> andersonDX, andersonDR;
     Vector andersonXLast, andersonRLast;
+    double andersonRLastNorm = 0.;
     bool andersonHaveLast = false;
     uint32_t andersonRestarts = 0;
 
@@ -846,11 +853,12 @@ void ElectronKineticsBoltzmann::solveEEColl()
                           << " eV (f0 " << eedf[iMax] << ") L1 " << l1 << " ratio " << ratio
                           << " meanGuess " << meanGuess << " meanNew " << meanNew << "\n";
             }
-            if (guessDiff < maxEedfRelError && ratio < 1.e-9)
+            const double innerTol = eeInnerTolFactor * maxEedfRelError;
+            if (guessDiff < innerTol && ratio < 1.e-9)
             {
                 hasConverged = true;
             }
-            else if (guessDiff < maxEedfRelError && iter > 200)
+            else if (guessDiff < innerTol && iter > 200)
             {
                 Log<PowerRatioError>::Warning(ratio);
                 hasConverged = true;
@@ -871,9 +879,32 @@ void ElectronKineticsBoltzmann::solveEEColl()
                 const double tiny = 1e-300;
                 const Vector x = eedfGuess.cwiseMax(tiny).array().log().matrix();
                 const Vector r = eedf.cwiseMax(tiny).array().log().matrix() - x;
+                static const bool andersonDebug = std::getenv("LOKIB_EE_DEBUG") != nullptr;
+                if (andersonDebug)
+                {
+                    // electron-weighted norm of the log residual: weight f * sqrt(u) * du (fraction of electrons per cell)
+                    double wn = 0.;
+                    Grid::Index kMax = 0;
+                    for (Grid::Index k = 0; k < grid().nCells(); ++k)
+                    {
+                        wn += r[k] * r[k] * eedfGuess[k] * std::sqrt(grid().getCell(k)) * grid().duCell(k);
+                        if (std::abs(r[k]) > std::abs(r[kMax])) kMax = k;
+                    }
+                    std::cerr << "anderson-debug iter " << iter << " |r| " << r.norm() << " |r|_w " << std::sqrt(wn)
+                              << " max|r| " << std::abs(r[kMax]) << " at " << grid().getCell(kMax) << " eV (f0 "
+                              << eedfGuess[kMax] << ") history " << andersonDR.size() << "\n";
+                }
+                // weights for the least squares and the restart test: 1, or the electron population per cell
+                Vector wt = Vector::Ones(x.size());
+                if (eeAndersonWeighted)
+                {
+                    for (Grid::Index k = 0; k < grid().nCells(); ++k)
+                        wt[k] = std::sqrt(eedfGuess[k] * std::sqrt(grid().getCell(k)) * grid().duCell(k));
+                }
+                const double rNorm = r.cwiseProduct(wt).norm();
                 if (andersonHaveLast)
                 {
-                    if (r.norm() > 2. * andersonRLast.norm())
+                    if (rNorm > eeAndersonRestartFactor * andersonRLastNorm)
                     {
                         // residual grew: restart the history
                         andersonDX.clear();
@@ -893,6 +924,7 @@ void ElectronKineticsBoltzmann::solveEEColl()
                 }
                 andersonXLast = x;
                 andersonRLast = r;
+                andersonRLastNorm = rNorm;
                 andersonHaveLast = true;
 
                 Vector xNew = x + eeMixingParameter * r;
@@ -905,7 +937,7 @@ void ElectronKineticsBoltzmann::solveEEColl()
                         DR.col(j) = andersonDR[static_cast<size_t>(j)];
                         DX.col(j) = andersonDX[static_cast<size_t>(j)];
                     }
-                    const Vector gamma = DR.colPivHouseholderQr().solve(r);
+                    const Vector gamma = (wt.asDiagonal() * DR).colPivHouseholderQr().solve(r.cwiseProduct(wt));
                     if (gamma.allFinite())
                     {
                         xNew = x - DX * gamma + eeMixingParameter * (r - DR * gamma);

@@ -259,13 +259,17 @@ private:
      *  for every growth model, with the usual "did not converge" warning.
      *  anderson: Anderson acceleration on ln(eedf) with history depth eeAndersonDepth (default 5) and step
      *  damping eeMixingParameter; same convergence test and cap as damped; the history is cleared (plain damped
-     *  step) when the residual grows by more than a factor 2.
+     *  step) when the residual grows by more than eeAndersonRestartFactor (default 2); eeAndersonWeighted (default false)
+     *  weights the least-squares problem and the restart test by the electron population per cell, f*sqrt(u)*du.
      */
     enum class EEUpdate { secant, damped, anderson };
     EEUpdate eeUpdate = EEUpdate::secant;
     double eeMixingParameter = 0.3;
     uint32_t eeMaxIterations = 1000;
     uint32_t eeAndersonDepth = 5;
+    double eeAndersonRestartFactor = 2.;   // clear the history when |r| grows by more than this factor
+    bool eeAndersonWeighted = false;       // least squares and restart test with electron weights f*sqrt(u)*du
+    double eeInnerTolFactor = 1.;          // damped/anderson: converge the e-e loop to this factor x maxEedfRelError
 
 };
 
