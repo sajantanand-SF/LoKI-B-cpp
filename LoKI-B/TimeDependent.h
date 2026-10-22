@@ -71,15 +71,42 @@ struct TimeDependentOptions
 
     bool gridFromPeakField = true;
 
-    double finalTime = 0.0;
+    double finalTime = 0.0;  // required unless periodic
     std::vector<double> sampleTimes;
+
+    /** Periodic steady state (needs a periodic waveform): march period by period until the period-averaged
+     *  state stops changing, then average over averagePeriods more periods and write phase-resolved samples
+     *  of the last one. Convergence: delta_p = max over cells of |fbar_p - fbar_{p-1}| / (|fbar_p| +
+     *  periodicAtol max fbar_p), also over <nu_eff>/N and the field power; with r = delta_p/delta_{p-1}, the
+     *  remaining change is estimated as delta_p r/(1-r) (10 delta_p if r >= 1), and the run is converged when
+     *  both are below periodicTol, after at least minPeriods.
+     */
+    bool periodic = false;
+    double periodicTol = 1e-5;
+    double periodicAtol = 1e-10;
+    unsigned minPeriods = 3;
+    unsigned maxPeriods = 100000;
+    unsigned averagePeriods = 1;
+    unsigned samplesPerPeriod = 32;
+    /// steps land on stepsPerPeriod equidistant phase points (also the default maxStep), and each period starts
+    /// with this step, so that a periodic state gives the same step sequence (and period averages) every period
+    unsigned stepsPerPeriod = 32;
+    /** Once delta_p < freezeTol, the accepted step times of that period (relative to its start) are reused in every
+     *  later period without error control. The period map is then smooth, with a true fixed point; with adaptive
+     *  steps, accept/reject decisions near err = 1 can otherwise make it alternate between two step sequences
+     *  (a numerical period-2 cycle whose amplitude sets a floor on delta_p).
+     */
+    double freezeTol = 1e-3;
 
     double rtol = 1e-4;
     double atol = 1e-12;
     double maxStep = 0.0;      // 0: no limit
     double initialStep = 0.0;  // 0: automatic
     double fixedStep = 0.0;    // > 0: fixed steps, no error control
-    bool lagNonLinear = false; // true: CIEff from the start of the step
+    /// CIEff in the implicit stages: iterate to nonLinearTol, lag (start of step), or extrapolate linearly
+    /// from the last two steps (one solve per stage)
+    enum class NonLinear { iterate, lag, extrapolate };
+    NonLinear nonLinear = NonLinear::iterate;
     unsigned maxNonLinearIter = 20;
     double nonLinearTol = 1e-10;
     unsigned long maxSteps = 100000000;
@@ -130,11 +157,21 @@ private:
     /// re-solve with the matrix currently in m_work
     void resolve(Vector &x);
     /// implicit stage: (W - a N A(c)) x = rhs, with c = CIEff(x) iterated unless lagged
-    void stage(double a, double EoN2, const Vector &rhs, double &c, Vector &x);
+    void stage(double a, double EoN2, const Vector &rhs, double &c, Vector &x, bool iterate);
     bool step(double h, double &errNorm);
     void sample();
     void openOutput();
     void emitState(const std::string &jobFolder);
+    void runPeriodic();
+    void advancePeriod(double t0, double T);
+    void writeEedfSamples();
+    double horizon() const;
+    /// gamma*(E/N)^2 * sum_k u_k du_k (F f)_k: power from the field per electron at unit density (eVm3/s)
+    double fieldPower(const Vector &f, double EoN2) const;
+    double meanEnergy(const Vector &f) const { return f.dot(m_u32du); }
+    void resetAccumulators();
+    void accumulate(double h, const Vector &fOld, double pfOld, double pgOld, double e2Old);
+    void writeCycleAverage(unsigned periods, double t0, double wall);
 
     ElectronKineticsBoltzmann &m_ek;
     WorkingConditions &m_wc;
@@ -146,6 +183,8 @@ private:
     Vector m_W;        // sqrt(u_k)/gamma
     Vector m_sqrtU;
     Vector m_numberWeights;  // sqrt(u_k) du_k, for the normalization
+    Vector m_uDu;            // u_k du_k
+    Vector m_u32du;          // u_k^(3/2) du_k
     Matrix m_A0;
     SparseMatrix m_F;  // field matrix at E/N = 1 for the current CIEff (Omega_c)
     double m_Fc = -1.0;  // CIEff used for m_F
@@ -160,7 +199,17 @@ private:
     double m_t = 0.0;
     double m_c = 0.0;
     double m_h = 0.0;
+    double m_cPrev = 0.0, m_tPrev = -1.0;  // for NonLinear::extrapolate
+
+    // time integrals (trapezoidal rule over accepted steps), used for period averages
+    bool m_accumulate = false;
+    Vector m_accF;
+    double m_accT = 0, m_accC = 0, m_accPfield = 0, m_accPgrowth = 0, m_accE2 = 0;
     std::size_t m_nextSample = 0;
+    std::vector<double> m_extraStops;  // landing points besides samples and breakpoints (periodic phase grid)
+    bool m_recordSchedule = false, m_frozen = false;
+    std::vector<double> m_schedule;    // accepted step end times of a period, relative to its start
+    double m_periodStart = 0.0;
     Diagnostics m_diag;
 
     std::filesystem::path m_outFolder;

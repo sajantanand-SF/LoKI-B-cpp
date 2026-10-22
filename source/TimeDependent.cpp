@@ -271,12 +271,33 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
     }
     gridFromPeakField = getBool(cnf, "gridFromPeakField", true);
 
-    finalTime = getDouble(cnf.at("finalTime"));
-    if (!(finalTime > 0))
-        throw std::runtime_error("timeDependent: finalTime must be positive.");
+    if (cnf.contains("periodic"))
+    {
+        const auto &pc = cnf.at("periodic");
+        periodic = getBool(pc, "isOn", true);
+        periodicTol = getDouble(pc, "tol", periodicTol);
+        periodicAtol = getDouble(pc, "atol", periodicAtol);
+        minPeriods = static_cast<unsigned>(getDouble(pc, "minPeriods", minPeriods));
+        maxPeriods = static_cast<unsigned>(getDouble(pc, "maxPeriods", maxPeriods));
+        averagePeriods = static_cast<unsigned>(getDouble(pc, "averagePeriods", averagePeriods));
+        samplesPerPeriod = static_cast<unsigned>(getDouble(pc, "samplesPerPeriod", samplesPerPeriod));
+        stepsPerPeriod = static_cast<unsigned>(getDouble(pc, "stepsPerPeriod", stepsPerPeriod));
+        freezeTol = getDouble(pc, "freezeTol", freezeTol);
+        if (averagePeriods < 1 || samplesPerPeriod < 1 || stepsPerPeriod < 1 || minPeriods < 2)
+            throw std::runtime_error("timeDependent.periodic: averagePeriods, samplesPerPeriod, stepsPerPeriod >= 1 and "
+                                     "minPeriods >= 2.");
+    }
+    if (periodic)
+        finalTime = getDouble(cnf, "finalTime", 0.0);  // not used to stop the run
+    else
+    {
+        finalTime = getDouble(cnf.at("finalTime"));
+        if (!(finalTime > 0))
+            throw std::runtime_error("timeDependent: finalTime must be positive.");
+    }
 
     sampleTimes = {0.0, finalTime};
-    if (cnf.contains("sampling"))
+    if (!periodic && cnf.contains("sampling"))
     {
         const auto &s = cnf.at("sampling");
         if (s.contains("times"))
@@ -320,9 +341,11 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
         fixedStep = getDouble(ig, "fixedStep", fixedStep);
         const std::string nl = getString(ig, "nonLinear", "iterate");
         if (nl == "lag")
-            lagNonLinear = true;
+            nonLinear = NonLinear::lag;
+        else if (nl == "extrapolate")
+            nonLinear = NonLinear::extrapolate;
         else if (nl != "iterate")
-            throw std::runtime_error("timeDependent: integrator.nonLinear must be 'iterate' or 'lag'.");
+            throw std::runtime_error("timeDependent: integrator.nonLinear must be 'iterate', 'lag' or 'extrapolate'.");
         maxNonLinearIter = static_cast<unsigned>(getDouble(ig, "maxNonLinearIterations", maxNonLinearIter));
         nonLinearTol = getDouble(ig, "nonLinearTolerance", nonLinearTol);
         maxSteps = static_cast<unsigned long>(getDouble(ig, "maxSteps", double(maxSteps)));
@@ -339,6 +362,11 @@ TimeDependentBoltzmann::TimeDependentBoltzmann(ElectronKineticsBoltzmann &ek, Wo
         m_outFolder = std::filesystem::path(LOKIB_OUTPUT_DIR) / cnf.at("output").at("folder").get<std::string>() /
                       "timeDependent";
     checkSupported();
+    if (m_opt.periodic && !(m_waveform->period() > 0))
+        throw std::runtime_error("timeDependent: periodic mode needs a periodic reducedField (sinusoid, or table with "
+                                 "periodic: true).");
+    if (m_opt.periodic && m_opt.maxStep <= 0 && m_opt.fixedStep <= 0)
+        m_opt.maxStep = m_waveform->period() / m_opt.stepsPerPeriod;
 }
 
 void TimeDependentBoltzmann::checkSupported() const
@@ -377,6 +405,8 @@ void TimeDependentBoltzmann::assembleFixedOperators()
     m_sqrtU = grid.getCells().cwiseSqrt();
     m_W = m_sqrtU / SI::gamma;
     m_numberWeights = m_sqrtU.cwiseProduct(grid.duCells());
+    m_uDu = grid.getCells().cwiseProduct(grid.duCells());
+    m_u32du = m_uDu.cwiseProduct(m_sqrtU);
 
     auto &ion = m_ek.ionizationOperator;
     auto &att = m_ek.attachmentOperator;
@@ -483,9 +513,9 @@ void TimeDependentBoltzmann::resolve(Vector &x)
     }
 }
 
-void TimeDependentBoltzmann::stage(double a, double EoN2, const Vector &rhs, double &c, Vector &x)
+void TimeDependentBoltzmann::stage(double a, double EoN2, const Vector &rhs, double &c, Vector &x, bool iterate)
 {
-    if (!m_nonConservative || m_opt.lagNonLinear)
+    if (!m_nonConservative || !iterate)
     {
         x = rhs;
         solveSystem(a, EoN2, c, x);
@@ -517,21 +547,27 @@ bool TimeDependentBoltzmann::step(double h, double &errNorm)
     evaluateField(m_c);
     const Vector zn = applyNA(m_f, reducedField2(m_t), m_c).cwiseQuotient(m_W);
 
+    // CIEff in the stages: iterated, lagged, or extrapolated from the last two accepted steps
+    using NL = TimeDependentOptions::NonLinear;
+    const bool extrapolate = m_opt.nonLinear == NL::extrapolate && m_tPrev >= 0 && m_t > m_tPrev;
+    const bool iterate = m_opt.nonLinear == NL::iterate || (m_opt.nonLinear == NL::extrapolate && !extrapolate);
+    const double slope = extrapolate ? (m_c - m_cPrev) / (m_t - m_tPrev) : 0.0;
+
     // stage 1: trapezoidal rule over [t, t + g h]
     const Vector rhs1 = m_W.cwiseProduct(m_f + (0.5 * g * h) * zn);
-    double cg = m_c;
+    double cg = m_c + slope * g * h;
     Vector fg(m_n);
-    stage(0.5 * g * h, reducedField2(m_t + g * h), rhs1, cg, fg);
+    stage(0.5 * g * h, reducedField2(m_t + g * h), rhs1, cg, fg, iterate);
     const Vector zg = (2.0 / (g * h)) * (fg - m_f) - zn;
 
     // stage 2: BDF2 over [t, t + g h, t + h]
     const Vector rhs2 = m_W.cwiseProduct(fg / (g * (2.0 - g)) - ((1.0 - g) * (1.0 - g) / (g * (2.0 - g))) * m_f);
-    double c1 = cg;
+    double c1 = extrapolate ? m_c + slope * h : cg;
     Vector f1(m_n);
-    stage(d * h, reducedField2(m_t + h), rhs2, c1, f1);
+    stage(d * h, reducedField2(m_t + h), rhs2, c1, f1, iterate);
 
     errNorm = 0.0;
-    if (m_opt.fixedStep <= 0)
+    if (m_opt.fixedStep <= 0 && !m_frozen)
     {
         const Vector z1 = (f1 - rhs2.cwiseQuotient(m_W)) / (d * h);
         // local error estimate (Bank et al. 1985; Hosea and Shampine 1996), filtered by the stage-2 matrix
@@ -549,9 +585,23 @@ bool TimeDependentBoltzmann::step(double h, double &errNorm)
 
     const double nrm = norm(f1);
     m_diag.maxNormDrift = std::max(m_diag.maxNormDrift, std::abs(nrm - 1.0));
+    double pfOld = 0, pgOld = 0, e2Old = 0;
+    Vector fOld;
+    if (m_accumulate)
+    {
+        evaluateField(m_c);
+        e2Old = reducedField2(m_t);
+        pfOld = fieldPower(m_f, e2Old);
+        pgOld = -m_c * meanEnergy(m_f);
+        fOld = m_f;
+    }
+    m_cPrev = m_c;
+    m_tPrev = m_t;
     m_f = f1 / nrm;
     m_c = ciEff(m_f);
     m_t += h;
+    if (m_accumulate)
+        accumulate(h, fOld, pfOld, pgOld, e2Old);
     m_diag.lastStep = h;
     m_diag.minEedf = std::min(m_diag.minEedf, m_f.minCoeff());
     return true;
@@ -562,7 +612,7 @@ void TimeDependentBoltzmann::initialize()
     const Grid &grid = m_ek.grid();
     if (m_opt.gridFromPeakField && grid.smartGrid())
     {
-        const double peak = m_waveform->peak(0.0, m_opt.finalTime);
+        const double peak = m_waveform->peak(0.0, horizon());
         Log<Message>::Notify("timeDependent: choosing the energy grid with the smart grid at the peak field ", peak,
                              " Td.");
         m_wc.updateReducedField(peak);
@@ -574,7 +624,7 @@ void TimeDependentBoltzmann::initialize()
     {
         double e0 = (*m_waveform)(0.0);
         if (m_opt.initialReducedField == "rms")
-            e0 = m_waveform->rms(0.0, m_opt.finalTime);
+            e0 = m_waveform->rms(0.0, horizon());
         else if (m_opt.initialReducedField == "value")
             e0 = m_opt.initialReducedFieldValue;
         Log<Message>::Notify("timeDependent: initial state is the steady solution at ", e0, " Td.");
@@ -592,6 +642,7 @@ void TimeDependentBoltzmann::initialize()
     m_f /= norm(m_f);
     m_c = ciEff(m_f);
     m_t = 0.0;
+    m_tPrev = -1.0;
     m_nextSample = 0;
     m_diag = Diagnostics();
     m_diag.minEedf = m_f.minCoeff();
@@ -608,8 +659,8 @@ void TimeDependentBoltzmann::initialize()
         double r = 0;
         for (Grid::Index i = 0; i < m_n; ++i)
             r = std::max(r, std::abs(z[i]) / (std::abs(m_f[i]) + m_opt.atol * fmax));
-        m_h = r > 0 ? 1e-2 * std::cbrt(m_opt.rtol) / r : 1e-3 * m_opt.finalTime;
-        m_h = std::min(m_h, 0.1 * m_opt.finalTime);
+        m_h = r > 0 ? 1e-2 * std::cbrt(m_opt.rtol) / r : 1e-3 * horizon();
+        m_h = std::min(m_h, 0.1 * horizon());
     }
 }
 
@@ -617,6 +668,9 @@ void TimeDependentBoltzmann::advance(double tEnd)
 {
     std::vector<double> stops = m_waveform->breakpoints(m_t, tEnd);
     for (double t : m_opt.sampleTimes)
+        if (t > m_t && t < tEnd)
+            stops.push_back(t);
+    for (double t : m_extraStops)
         if (t > m_t && t < tEnd)
             stops.push_back(t);
     stops.push_back(tEnd);
@@ -633,7 +687,7 @@ void TimeDependentBoltzmann::advance(double tEnd)
         if (m_opt.maxStep > 0)
             hTrial = std::min(hTrial, m_opt.maxStep);
         double h = hTrial;
-        if (m_t + h >= target - eps)
+        if (m_frozen || m_t + h >= target - eps)
             h = target - m_t;
         else if (m_t + 1.5 * h > target)
             h = 0.5 * (target - m_t);
@@ -643,7 +697,9 @@ void TimeDependentBoltzmann::advance(double tEnd)
         ++m_diag.steps;
         if (m_diag.steps > m_opt.maxSteps)
             throw std::runtime_error("timeDependent: maxSteps exceeded.");
-        if (m_opt.fixedStep <= 0)
+        if (ok && m_recordSchedule)
+            m_schedule.push_back(m_t - m_periodStart);
+        if (m_opt.fixedStep <= 0 && !m_frozen)
         {
             const double fac = std::clamp(err > 0 ? 0.9 * std::pow(err, -1.0 / 3.0) : 5.0, 0.2, 5.0);
             if (ok)
@@ -746,24 +802,219 @@ void TimeDependentBoltzmann::emitState(const std::string &jobFolder)
                               &m_ek.firstAnisotropy);
 }
 
+double TimeDependentBoltzmann::horizon() const
+{
+    return m_opt.periodic ? m_waveform->period() : m_opt.finalTime;
+}
+
+double TimeDependentBoltzmann::fieldPower(const Vector &f, double EoN2) const
+{
+    return SI::gamma * EoN2 * m_uDu.dot(m_F * f);
+}
+
+void TimeDependentBoltzmann::resetAccumulators()
+{
+    m_accF = Vector::Zero(m_n);
+    m_accT = m_accC = m_accPfield = m_accPgrowth = m_accE2 = 0.0;
+}
+
+void TimeDependentBoltzmann::accumulate(double h, const Vector &fOld, double pfOld, double pgOld, double e2Old)
+{
+    evaluateField(m_c);
+    const double e2 = reducedField2(m_t);
+    m_accT += h;
+    m_accF += (0.5 * h) * (fOld + m_f);
+    m_accC += 0.5 * h * (ciEff(fOld) + m_c);
+    m_accPfield += 0.5 * h * (pfOld + fieldPower(m_f, e2));
+    m_accPgrowth += 0.5 * h * (pgOld - m_c * meanEnergy(m_f));
+    m_accE2 += 0.5 * h * (e2Old + e2);
+}
+
+void TimeDependentBoltzmann::runPeriodic()
+{
+    const auto begin = std::chrono::steady_clock::now();
+    const double T = m_waveform->period();
+    std::ofstream conv;
+    if (!m_outFolder.empty())
+    {
+        conv.open(m_outFolder / "periodConvergence.txt");
+        conv << "# period t_end(s) delta ratio remainingEstimate CIEffbar(m3/s) meanEnergybar(eV) Pfieldbar(eVm3/s) "
+                "steps\n" << std::scientific << std::setprecision(8);
+    }
+    Vector fbarOld;
+    double cOld = 0, pOld = 0, deltaOld = 0;
+    unsigned p = 0, compared = 0;  // compared: period-to-period comparisons on the current (adaptive or frozen) map
+    bool converged = false;
+    for (; p < m_opt.maxPeriods && !converged; ++p)
+    {
+        const double t0 = m_t;
+        const bool frozenBefore = m_frozen;
+        m_opt.sampleTimes = {t0 + T};  // one timeSeries row per period
+        m_nextSample = 0;
+        resetAccumulators();
+        m_accumulate = true;
+        advancePeriod(t0, T);
+        m_accumulate = false;
+        const Vector fbar = m_accF / m_accT;
+        const double cbar = m_accC / m_accT, pbar = m_accPfield / m_accT;
+        double delta = std::numeric_limits<double>::infinity(), ratio = 0, remaining = 0;
+        if (p > 0)
+        {
+            const double fmax = fbar.cwiseAbs().maxCoeff();
+            delta = 0;
+            for (Grid::Index i = 0; i < m_n; ++i)
+                delta = std::max(delta, std::abs(fbar[i] - fbarOld[i]) / (std::abs(fbar[i]) + m_opt.periodicAtol * fmax));
+            if (m_nonConservative && cbar != 0)
+                delta = std::max(delta, std::abs(cbar - cOld) / std::abs(cbar));
+            delta = std::max(delta, std::abs(pbar - pOld) / std::abs(pbar));
+            // the first period on the frozen schedule is compared with an adaptive one: not used for the estimate
+            if (frozenBefore || !m_frozen)
+                ++compared;
+            ratio = compared >= 2 && deltaOld > 0 ? delta / deltaOld : 1.0;
+            remaining = ratio < 1 ? delta * ratio / (1 - ratio) : 10 * delta;
+            converged = p + 1 >= m_opt.minPeriods && compared >= 2 && delta < m_opt.periodicTol &&
+                        remaining < m_opt.periodicTol;
+            if (!converged && !m_frozen && m_opt.fixedStep <= 0 && delta < m_opt.freezeTol)
+            {
+                m_frozen = true;  // reuse this period's step schedule from now on
+                compared = 0;
+                Log<Message>::Notify("timeDependent: step schedule frozen after period ", p + 1, " (",
+                                     m_schedule.size(), " steps per period).");
+            }
+        }
+        if (conv.is_open())
+            conv << p + 1 << ' ' << m_t << ' ' << delta << ' ' << ratio << ' ' << remaining << ' ' << cbar << ' '
+                 << meanEnergy(fbar) << ' ' << pbar << ' ' << m_diag.steps << ' ' << (m_frozen ? 1 : 0) << '\n'
+                 << std::flush;
+        fbarOld = fbar;
+        cOld = cbar;
+        pOld = pbar;
+        deltaOld = delta;
+    }
+    if (!converged)
+        Log<Message>::Warning("timeDependent: no periodic steady state after ", p, " periods (periodic.tol = ",
+                              m_opt.periodicTol, ").");
+    else
+        Log<Message>::Notify("timeDependent: periodic steady state after ", p, " periods.");
+
+    // averaging window: averagePeriods periods, phase-resolved samples in the last one
+    const double tAvg0 = m_t;
+    resetAccumulators();
+    m_accumulate = true;
+    for (unsigned q = 0; q < m_opt.averagePeriods; ++q)
+    {
+        const double t0 = m_t;
+        m_opt.sampleTimes.clear();
+        if (q + 1 == m_opt.averagePeriods)
+            for (unsigned j = 1; j <= m_opt.samplesPerPeriod; ++j)
+                m_opt.sampleTimes.push_back(t0 + T * j / m_opt.samplesPerPeriod);
+        else
+            m_opt.sampleTimes.push_back(t0 + T);
+        m_nextSample = 0;
+        if (q + 1 == m_opt.averagePeriods)
+        {
+            // the phase-resolved EEDFs are those of the last period only
+            m_eedfTimes.clear();
+            m_eedfFields.clear();
+            m_eedfSamples.clear();
+            sample();
+        }
+        advancePeriod(t0, T);
+    }
+    m_accumulate = false;
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    writeCycleAverage(p + m_opt.averagePeriods, tAvg0, wall);
+}
+
+void TimeDependentBoltzmann::advancePeriod(double t0, double T)
+{
+    m_extraStops.clear();
+    m_periodStart = t0;
+    if (m_frozen)
+    {
+        for (double s : m_schedule)
+            if (s < T * (1 - 1e-12))
+                m_extraStops.push_back(t0 + s);
+    }
+    else
+    {
+        for (unsigned j = 1; j < m_opt.stepsPerPeriod; ++j)
+            m_extraStops.push_back(t0 + T * j / m_opt.stepsPerPeriod);
+        if (m_opt.fixedStep <= 0)
+            m_h = T / m_opt.stepsPerPeriod;
+        m_schedule.clear();
+        m_recordSchedule = m_opt.fixedStep <= 0;
+    }
+    advance(t0 + T);
+    m_recordSchedule = false;
+    m_extraStops.clear();
+}
+
+void TimeDependentBoltzmann::writeCycleAverage(unsigned periods, double t0, double wall)
+{
+    const Grid &grid = m_ek.grid();
+    const Vector fbar = m_accF / m_accT;
+    const double cbar = m_accC / m_accT, pfield = m_accPfield / m_accT, pgrowth = m_accPgrowth / m_accT;
+    const double erms = m_waveform->rms(0.0, m_waveform->period());  // exact; m_accE2 is the quadrature value
+    const double ermsQuad = std::sqrt(m_accE2 / m_accT) / SI::Townsend;
+
+    // LoKI-B files for the cycle-averaged state: the EEDF, rate coefficients and every power term that is linear
+    // in f come from fbar; the field and growth powers (nonlinear in time) are the time averages.
+    m_wc.setCurrentJobFolder("td_cycleAverage");
+    m_wc.updateReducedField(erms);
+    m_ek.eedf = fbar;
+    m_ek.CIEff = cbar;
+    const double cEff =
+        (m_nonConservative && m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm) ? cbar : 0.0;
+    m_ek.fieldOperator.evaluate(grid, m_ek.mixture.collision_data().totalCrossSection(), 1.0, 0.0, cEff);
+    m_ek.evaluatePower();
+    Power &pw = m_ek.power;
+    pw.field = pfield;
+    if (m_nonConservative)
+        pw.eDensGrowth = pgrowth;
+    pw.balance = pw.field + pw.elasticNet + pw.carNet + pw.inelastic + pw.superelastic + pw.eDensGrowth +
+                 pw.electronElectronNet;
+    pw.reference = pw.field + std::max(pw.elasticGain, 0.0) + std::max(pw.carGain, 0.0) + std::max(pw.superelastic, 0.0);
+    pw.relativeBalance = std::abs(pw.balance) / pw.reference;
+    m_ek.mixture.collision_data().evaluateRateCoefficients(grid, m_ek.eedf);
+    m_ek.evaluateSwarmParameters();
+    m_ek.evaluateFirstAnisotropy();
+    m_ek.obtainedNewEedf.emit(grid, m_ek.eedf, m_wc, m_ek.power, m_ek.mixture.collision_data(), m_ek.swarmParameters,
+                              &m_ek.firstAnisotropy);
+
+    std::ostringstream os;
+    os << std::scientific << std::setprecision(10);
+    os << "periods " << periods << "\naveragingWindow " << t0 << ' ' << m_t << "\nperiod " << m_waveform->period()
+       << "\nreducedFieldRMS(Td) " << erms << "\nreducedFieldRMSQuadrature(Td) " << ermsQuad << "\nmeanEnergy(eV) " << meanEnergy(fbar) << "\nCIEff(m3/s) " << cbar
+       << "\nPfield(eVm3/s) " << pfield << "\nPeDensGrowth(eVm3/s) " << pgrowth << "\nPelastic(eVm3/s) " << pw.elasticNet
+       << "\nPinelastic(eVm3/s) " << pw.inelastic << "\nPsuperelastic(eVm3/s) " << pw.superelastic
+       << "\nPbalance(eVm3/s) " << pw.balance << "\nrelativeBalance " << pw.relativeBalance << "\nsteps "
+       << m_diag.steps << "\nrejected " << m_diag.rejected << "\nsolves " << m_diag.solves << "\nmaxNormDrift "
+       << m_diag.maxNormDrift << "\ncells " << m_n << "\nuMax " << grid.uMax() << "\nwallTime " << wall << " s\n";
+    Log<Message>::Notify("timeDependent cycle average:\n", os.str());
+    if (!m_outFolder.empty())
+        std::ofstream(m_outFolder / "cycleAverage.txt") << os.str();
+}
+
 void TimeDependentBoltzmann::run()
 {
     const auto begin = std::chrono::steady_clock::now();
     initialize();
     openOutput();
-    if (!m_opt.sampleTimes.empty() && m_opt.sampleTimes.front() <= 0.0)
-    {
-        sample();
-        ++m_nextSample;
-    }
+    sample();
+    if (!m_opt.periodic)
+        ++m_nextSample;  // sampleTimes[0] == 0
     emitState("td_initial");
-    advance(m_opt.finalTime);
+    if (m_opt.periodic)
+        runPeriodic();
+    else
+        advance(m_opt.finalTime);
     emitState("td_final");
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
 
     std::ostringstream summary;
-    summary << "finalTime " << m_opt.finalTime << " s\nsteps " << m_diag.steps << "\nrejected " << m_diag.rejected
+    summary << "finalTime " << m_t << " s\nsteps " << m_diag.steps << "\nrejected " << m_diag.rejected
             << "\nsolves " << m_diag.solves << "\nmaxNormDrift " << m_diag.maxNormDrift << "\nminEedf "
             << m_diag.minEedf << "\ncells " << m_n << "\nuMax " << m_ek.grid().uMax() << "\nwallTime " << elapsed
             << " s\n";
@@ -771,6 +1022,13 @@ void TimeDependentBoltzmann::run()
     if (m_outFolder.empty())
         return;
     std::ofstream(m_outFolder / "summary.txt") << summary.str();
+    writeEedfSamples();
+}
+
+void TimeDependentBoltzmann::writeEedfSamples()
+{
+    if (m_outFolder.empty())
+        return;
     std::ofstream os(m_outFolder / "eedf_t.txt");
     os << "# EEDF (eV^-3/2) at the sampled times; column 1: energy (eV), then one column per time\n# t(s):";
     os << std::scientific << std::setprecision(10);
