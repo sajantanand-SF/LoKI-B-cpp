@@ -26,6 +26,7 @@ target_sources(loki-b PRIVATE
    ../source/Range.cpp
    ../source/Simulation.cpp
    ../source/StateEntry.cpp
+   ../source/TimeDependent.cpp
    ../source/WorkingConditions.cpp
 )
 

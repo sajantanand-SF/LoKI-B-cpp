@@ -44,6 +44,13 @@ Simulation::Simulation(const std::filesystem::path &basePath,const json_type &cn
             case EedfType::boltzmann:
                 initializeJobs(cnf.at("workingConditions"),true);
                 m_electronKinetics = std::make_unique<ElectronKineticsBoltzmann>(basePath, cnf.at("electronKinetics"), &m_workingConditions);
+                if (cnf.at("electronKinetics").contains("timeDependent") &&
+                    cnf.at("electronKinetics").at("timeDependent").contains("isOn") &&
+                    cnf.at("electronKinetics").at("timeDependent").at("isOn").get<bool>())
+                {
+                    m_timeDependent = std::make_unique<TimeDependentBoltzmann>(
+                        static_cast<ElectronKineticsBoltzmann &>(*m_electronKinetics), m_workingConditions, cnf, basePath);
+                }
             break;
             case EedfType::prescribed:
                 initializeJobs(cnf.at("workingConditions"),false);
@@ -58,6 +65,14 @@ Simulation::Simulation(const std::filesystem::path &basePath,const json_type &cn
 
 void Simulation::run()
 {
+    if (m_timeDependent)
+    {
+        if (m_jobManager.njobs() != 1)
+            throw std::runtime_error("timeDependent: workingConditions.reducedField must be a single value.");
+        m_jobManager.prepareFirstJob();
+        m_timeDependent->run();
+        return;
+    }
     if (m_electronKinetics.get())
     {
         m_jobManager.prepareFirstJob();

@@ -44,6 +44,8 @@
 namespace loki
 {
 
+class TimeDependentBoltzmann;
+
 class ElectronKinetics
 {
 protected:
@@ -137,6 +139,8 @@ protected:
 
 class ElectronKineticsBoltzmann : public ElectronKinetics
 {
+    // the time-dependent solver reuses the operators and evaluation helpers of this class
+    friend class TimeDependentBoltzmann;
 public:
     ElectronKineticsBoltzmann(const std::filesystem::path &basePath, const json_type &cnf, WorkingConditions *workingConditions);
 protected:

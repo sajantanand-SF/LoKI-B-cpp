@@ -32,6 +32,7 @@
 #define LOKI_CPP_SIMULATION_H
 
 #include "LoKI-B/ElectronKinetics.h"
+#include "LoKI-B/TimeDependent.h"
 #include "LoKI-B/JobSystem.h"
 #include "LoKI-B/WorkingConditions.h"
 #include "LoKI-B/json.h"
@@ -91,6 +92,8 @@ private:
     JobManager m_jobManager;
     std::unique_ptr<ElectronKinetics> m_electronKinetics;
     ElectronKinetics::ResultEvent m_obtainedResults;
+    // set only when electronKinetics.timeDependent.isOn is true
+    std::unique_ptr<TimeDependentBoltzmann> m_timeDependent;
 };
 } // namespace loki
 
