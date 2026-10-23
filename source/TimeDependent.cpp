@@ -99,6 +99,14 @@ public:
     }
     double operator()(double t) const override { return m_off + m_a * std::sin(2 * Constant::pi * m_f * t + m_phi); }
     double period() const override { return 1.0 / m_f; }
+    bool sinusoid(double &amplitude, double &omega, double &phase, double &offset) const override
+    {
+        amplitude = m_a;
+        omega = 2 * Constant::pi * m_f;
+        phase = m_phi;
+        offset = m_off;
+        return true;
+    }
     double peak(double, double) const override { return std::abs(m_off) + std::abs(m_a); }
     double rms(double, double) const override { return std::sqrt(m_off * m_off + 0.5 * m_a * m_a); }
 private:
@@ -176,6 +184,17 @@ private:
     std::vector<double> m_t, m_e;
     bool m_periodic;
 };
+
+/// replace the field power (and recompute the balance) after ElectronKineticsBoltzmann::evaluatePower
+void setFieldPower(Power &pw, double field)
+{
+    pw.field = field;
+    pw.balance = pw.field + pw.elasticNet + pw.carNet + pw.inelastic + pw.superelastic + pw.eDensGrowth +
+                 pw.electronElectronNet;
+    pw.reference = std::max(pw.field, 0.0) + std::max(pw.elasticGain, 0.0) + std::max(pw.carGain, 0.0) +
+                   std::max(pw.superelastic, 0.0) + std::max(pw.electronElectronGain, 0.0);
+    pw.relativeBalance = pw.reference > 0 ? std::abs(pw.balance) / pw.reference : 0.0;
+}
 
 } // namespace
 
@@ -274,6 +293,13 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
             throw std::runtime_error("timeDependent: initialCondition.type must be 'steadyState' or 'maxwellian'.");
     }
     gridFromPeakField = getBool(cnf, "gridFromPeakField", true);
+    const std::string an = getString(cnf, "anisotropy", "quasiStatic");
+    if (an == "quasiStatic")
+        anisotropy = Anisotropy::quasiStatic;
+    else if (an == "dynamic")
+        anisotropy = Anisotropy::dynamic;
+    else
+        throw std::runtime_error("timeDependent: anisotropy must be 'quasiStatic' or 'dynamic', not '" + an + "'.");
 
     if (cnf.contains("periodic"))
     {
@@ -285,7 +311,10 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
         maxPeriods = static_cast<unsigned>(getDouble(pc, "maxPeriods", maxPeriods));
         averagePeriods = static_cast<unsigned>(getDouble(pc, "averagePeriods", averagePeriods));
         samplesPerPeriod = static_cast<unsigned>(getDouble(pc, "samplesPerPeriod", samplesPerPeriod));
-        stepsPerPeriod = static_cast<unsigned>(getDouble(pc, "stepsPerPeriod", stepsPerPeriod));
+        // dynamic f1 oscillates at omega; TR-BDF2 resolves the forced response to ~(omega h)^2/12, so it needs finer
+        // steps than quasi-static f1 (V7: 32 steps per period bias the heating by ~1e-3, 128 by < 1e-4)
+        stepsPerPeriod = static_cast<unsigned>(
+            getDouble(pc, "stepsPerPeriod", anisotropy == Anisotropy::dynamic ? 128u : stepsPerPeriod));
         freezeTol = getDouble(pc, "freezeTol", freezeTol);
         if (averagePeriods < 1 || samplesPerPeriod < 1 || stepsPerPeriod < 1 || minPeriods < 2)
             throw std::runtime_error("timeDependent.periodic: averagePeriods, samplesPerPeriod, stepsPerPeriod >= 1 and "
@@ -413,6 +442,13 @@ void TimeDependentBoltzmann::assembleFixedOperators()
     m_numberWeights = m_sqrtU.cwiseProduct(grid.duCells());
     m_uDu = grid.getCells().cwiseProduct(grid.duCells());
     m_u32du = m_uDu.cwiseProduct(m_sqrtU);
+    m_dynF1 = m_opt.anisotropy == TimeDependentOptions::Anisotropy::dynamic;
+    m_uNode = grid.getNodes();
+    m_sqrtUNode = m_uNode.cwiseSqrt();
+    m_dc = grid.isUniform() ? Vector(Vector::Constant(m_n, grid.du())) : Vector(grid.duCells());
+    m_dn = Vector::Zero(m_n + 1);
+    for (Grid::Index j = 1; j < m_n; ++j)
+        m_dn[j] = grid.isUniform() ? grid.du() : grid.duNode(j);
 
     auto &ion = m_ek.ionizationOperator;
     auto &att = m_ek.attachmentOperator;
@@ -464,7 +500,7 @@ void TimeDependentBoltzmann::assembleFixedOperators()
                              ? "swarm"
                              : (m_opt.electronDensity == TimeDependentOptions::ElectronDensity::constant ? "constant"
                                                                                                          : "external"),
-                         m_ee ? ", e-e collisions on" : "");
+                         m_ee ? ", e-e collisions on" : "", m_dynF1 ? ", dynamic f1" : ", quasi-static f1");
 }
 
 double TimeDependentBoltzmann::fieldGrowthTerm(double c) const
@@ -609,6 +645,8 @@ void TimeDependentBoltzmann::stage(double a, double EoN2, const Vector &rhs, Non
 
 bool TimeDependentBoltzmann::step(double h, double &errNorm)
 {
+    if (m_dynF1)
+        return stepDynamic(h, errNorm);
     static const double g = 2.0 - std::sqrt(2.0);
     static const double d = (1.0 - g) / (2.0 - g);
     static const double k = (-3.0 * g * g + 4.0 * g - 2.0) / (12.0 * (2.0 - g));
@@ -702,6 +740,356 @@ bool TimeDependentBoltzmann::step(double h, double &errNorm)
     return true;
 }
 
+// ---------------------------------------------------------------- dynamic anisotropy
+
+Vector TimeDependentBoltzmann::steadyStateHF(const Vector &f0, double ErmsSI, double WoN)
+{
+    // same fixed point as ElectronKineticsBoltzmann (temporal growth): A0 + Erms^2 F_HF(Omega_PT) + growth (+ e-e)
+    Vector f = f0 / norm(f0);
+    SparseMatrix F = m_F;
+    double c = ciEff(f);
+    for (unsigned it = 0; it < 500; ++it)
+    {
+        m_ek.fieldOperator.evaluate(m_ek.grid(), m_ek.mixture.collision_data().totalCrossSection(), 1.0, WoN,
+                                    fieldGrowthTerm(c), F);
+        Matrix M = m_A0;
+        for (int k = 0; k < F.outerSize(); ++k)
+            for (SparseMatrix::InnerIterator iF(F, k); iF; ++iF)
+                M(iF.row(), iF.col()) += ErmsSI * ErmsSI * iF.value();
+        const NonLinearState nl = nonLinearState(f);
+        for (Grid::Index k = 0; k < m_n; ++k)
+        {
+            if (m_nonConservative)
+                M(k, k) -= (c / SI::gamma) * m_sqrtU[k];
+            if (m_ee)
+            {
+                M(k, k) -= nl.A[k] + nl.B[k];
+                if (k > 0)
+                    M(k, k - 1) += nl.A[k - 1];
+                if (k < m_n - 1)
+                    M(k, k + 1) += nl.B[k + 1];
+            }
+        }
+        Vector fNew(m_n);
+        solveEEDF(fNew, M, m_ek.grid());
+        const double cNew = ciEff(fNew);
+        double df = 0;
+        const double fmax = fNew.maxCoeff();
+        for (Grid::Index i = 0; i < m_n; ++i)
+            df = std::max(df, std::abs(fNew[i] - f[i]) / (std::abs(fNew[i]) + 1e-12 * fmax));
+        f = m_ee ? (0.3 * fNew + 0.7 * f).eval() : fNew;
+        f /= norm(f);
+        const bool converged = df < 1e-9 && (!m_nonConservative || std::abs(cNew - c) <= 1e-10 * std::abs(cNew));
+        c = 0.7 * cNew + 0.3 * c;
+        if (converged)
+            break;
+    }
+    m_Fc = std::numeric_limits<double>::quiet_NaN();  // m_F must be re-evaluated (WoN = 0)
+    return f;
+}
+
+Vector TimeDependentBoltzmann::harmonicF1(const Vector &f, double A, double omega, double phase, double t,
+                                          double c) const
+{
+    // (1/(N gamma sqrt u)) df1/dt + Omega f1 = -A sin(omega t + phase) D:
+    // f1 = -A D Im[exp(i(omega t + phase)) / (Omega + i omega/(N gamma sqrt u))]
+    const Vector g = fieldCoefficientNodes(c), D = gradientNodes(f);
+    Vector f1 = Vector::Zero(m_n + 1);
+    for (Grid::Index j = 1; j < m_n; ++j)
+    {
+        const double om = m_uNode[j] / (3.0 * g[j]), w = omega / (m_N * SI::gamma * m_sqrtUNode[j]);
+        const double th = omega * t + phase;
+        f1[j] = -A * D[j] * (om * std::sin(th) - w * std::cos(th)) / (om * om + w * w);
+    }
+    return f1;
+}
+
+double TimeDependentBoltzmann::reducedFieldSI(double t) const
+{
+    return (*m_waveform)(t) * SI::Townsend;
+}
+
+Vector TimeDependentBoltzmann::fieldCoefficientNodes(double c) const
+{
+    // as FieldOperator::evaluate (WoN = 0): g_j = (u_j/3)/Omega_j, Omega_j = sigma_c,j + cEff/(gamma sqrt(u_j))
+    const Vector &cs = m_ek.mixture.collision_data().totalCrossSection();
+    const double cEff = fieldGrowthTerm(c);
+    Vector g = Vector::Zero(m_n + 1);
+    for (Grid::Index j = 1; j < m_n; ++j)
+        g[j] = (1. / 3.) * m_uNode[j] / (cs[j] + cEff / (SI::gamma * m_sqrtUNode[j]));
+    return g;
+}
+
+Vector TimeDependentBoltzmann::gradientNodes(const Vector &f) const
+{
+    Vector D = Vector::Zero(m_n + 1);
+    for (Grid::Index j = 1; j < m_n; ++j)
+        D[j] = (f[j] - f[j - 1]) / m_dn[j];
+    return D;
+}
+
+Vector TimeDependentBoltzmann::divergence(const Vector &phi) const
+{
+    Vector r(m_n);
+    for (Grid::Index k = 0; k < m_n; ++k)
+        r[k] = (phi[k + 1] - phi[k]) / m_dc[k];
+    return r;
+}
+
+Vector TimeDependentBoltzmann::quasiStaticF1(const Vector &f, double e, double c) const
+{
+    // f1 = -e D / Omega = -e D (3 g / u)
+    const Vector g = fieldCoefficientNodes(c), D = gradientNodes(f);
+    Vector f1 = Vector::Zero(m_n + 1);
+    for (Grid::Index j = 1; j < m_n; ++j)
+        f1[j] = -e * D[j] * 3.0 * g[j] / m_uNode[j];
+    return f1;
+}
+
+Vector TimeDependentBoltzmann::f1Derivative(const Vector &f, const Vector &f1, double e, double c) const
+{
+    const Vector g = fieldCoefficientNodes(c), D = gradientNodes(f);
+    Vector z = Vector::Zero(m_n + 1);
+    for (Grid::Index j = 1; j < m_n; ++j)
+    {
+        const double omega = m_uNode[j] / (3.0 * g[j]);
+        z[j] = m_N * SI::gamma * m_sqrtUNode[j] * (-omega * f1[j] - e * D[j]);
+    }
+    return z;
+}
+
+Vector TimeDependentBoltzmann::applyNADynamic(const Vector &f, const Vector &f1, double e,
+                                              const NonLinearState &nl) const
+{
+    Vector phi = Vector::Zero(m_n + 1);
+    for (Grid::Index j = 1; j < m_n; ++j)
+        phi[j] = -e * (m_uNode[j] / 3.0) * f1[j];
+    Vector r = m_A0 * f + divergence(phi);
+    if (m_nonConservative)
+        r -= (nl.c / SI::gamma) * m_sqrtU.cwiseProduct(f);
+    if (m_ee)
+        for (Grid::Index k = 0; k < m_n; ++k)
+        {
+            r[k] -= (nl.A[k] + nl.B[k]) * f[k];
+            if (k > 0)
+                r[k] += nl.A[k - 1] * f[k - 1];
+            if (k < m_n - 1)
+                r[k] += nl.B[k + 1] * f[k + 1];
+        }
+    return m_N * r;
+}
+
+double TimeDependentBoltzmann::fieldPowerDynamic(const Vector &f1, double e) const
+{
+    Vector phi = Vector::Zero(m_n + 1);
+    for (Grid::Index j = 1; j < m_n; ++j)
+        phi[j] = -e * (m_uNode[j] / 3.0) * f1[j];
+    return SI::gamma * m_uDu.dot(divergence(phi));
+}
+
+double TimeDependentBoltzmann::currentFieldPower() const
+{
+    return fieldPowerDynamic(m_f1, reducedFieldSI(m_t));
+}
+
+void TimeDependentBoltzmann::solveSystemDynamic(double a, double e, const Vector &r1, const NonLinearState &nl,
+                                                const Vector &rhs0, Vector &x0, Vector &x1)
+{
+    // f1 = (r1 - a N gamma sqrt(u) e D(f0)) / (1 + a nu), nu = N gamma sqrt(u) Omega; substituted in the f0 stage:
+    // W f0 - aN (A_rest f0 + div(geff D f0)) = rhs0 + aN div(phiHist), geff = e^2 g kappa, kappa = a nu/(1 + a nu)
+    const Vector g = fieldCoefficientNodes(nl.c);
+    Vector geff = Vector::Zero(m_n + 1), phiHist = Vector::Zero(m_n + 1), den = Vector::Ones(m_n + 1);
+    for (Grid::Index j = 1; j < m_n; ++j)
+    {
+        const double nu = m_N * SI::gamma * m_sqrtUNode[j] * m_uNode[j] / (3.0 * g[j]);
+        den[j] = 1.0 + a * nu;
+        geff[j] = e * e * g[j] * (a * nu / den[j]);
+        phiHist[j] = -e * (m_uNode[j] / 3.0) * r1[j] / den[j];
+    }
+    const double s = -a * m_N;
+    m_work.noalias() = s * m_A0;
+    for (Grid::Index k = 0; k < m_n; ++k)
+    {
+        m_work(k, k) += m_W[k];
+        if (m_nonConservative)
+            m_work(k, k) += a * m_N * (nl.c / SI::gamma) * m_sqrtU[k];
+        if (m_ee)
+        {
+            m_work(k, k) -= s * (nl.A[k] + nl.B[k]);
+            if (k > 0)
+                m_work(k, k - 1) += s * nl.A[k - 1];
+            if (k < m_n - 1)
+                m_work(k, k + 1) += s * nl.B[k + 1];
+        }
+        // field: (geff_{k+1} D_{k+1} - geff_k D_k)/dc_k, D_j = (f_j - f_{j-1})/dn_j
+        if (k > 0)
+        {
+            const double w = geff[k] / (m_dn[k] * m_dc[k]);
+            m_work(k, k - 1) += s * w;
+            m_work(k, k) -= s * w;
+        }
+        if (k < m_n - 1)
+        {
+            const double w = geff[k + 1] / (m_dn[k + 1] * m_dc[k]);
+            m_work(k, k + 1) += s * w;
+            m_work(k, k) -= s * w;
+        }
+    }
+    x0 = rhs0 + (a * m_N) * divergence(phiHist);
+    if (m_solver == Solver::lu)
+        m_lu.compute(m_work);
+    resolve(x0);
+    const Vector D = gradientNodes(x0);
+    x1 = Vector::Zero(m_n + 1);
+    for (Grid::Index j = 1; j < m_n; ++j)
+        x1[j] = (r1[j] - a * m_N * SI::gamma * m_sqrtUNode[j] * e * D[j]) / den[j];
+}
+
+void TimeDependentBoltzmann::stageDynamic(double a, double e, const Vector &rhs0, const Vector &r1,
+                                          NonLinearState &nl, Vector &x0, Vector &x1, bool iterate)
+{
+    solveSystemDynamic(a, e, r1, nl, rhs0, x0, x1);
+    if (!iterate || (!m_nonConservative && !m_ee))
+        return;
+    for (unsigned it = 1;; ++it)
+    {
+        if (!x0.allFinite())
+            break;
+        const NonLinearState nlNew = nonLinearState(x0);
+        bool done = std::abs(nlNew.c - nl.c) <= m_opt.nonLinearTol * std::abs(nlNew.c) || nlNew.c == nl.c;
+        nl = nlNew;
+        const Vector xOld = x0;
+        if (done && !m_ee)
+            break;
+        solveSystemDynamic(a, e, r1, nl, rhs0, x0, x1);
+        if (m_ee)
+        {
+            const double fmax = x0.cwiseAbs().maxCoeff();
+            double dx = 0;
+            for (Grid::Index i = 0; i < m_n; ++i)
+                dx = std::max(dx, std::abs(x0[i] - xOld[i]) / (std::abs(x0[i]) + m_opt.atol * fmax));
+            if (done && dx <= m_opt.eeTol)
+                break;
+        }
+        if (it >= m_opt.maxNonLinearIter)
+        {
+            Log<Message>::Warning("timeDependent: nonlinear (CIEff/e-e) iteration did not converge at t = ", m_t, " s.");
+            break;
+        }
+    }
+}
+
+bool TimeDependentBoltzmann::stepDynamic(double h, double &errNorm)
+{
+    static const double g = 2.0 - std::sqrt(2.0);
+    static const double d = (1.0 - g) / (2.0 - g);
+    static const double k = (-3.0 * g * g + 4.0 * g - 2.0) / (12.0 * (2.0 - g));
+    const double cg2 = 1.0 / (g * (2.0 - g)), cn2 = (1.0 - g) * (1.0 - g) / (g * (2.0 - g));
+
+    const NonLinearState nln = nonLinearState(m_f);
+    const double en = reducedFieldSI(m_t), eg = reducedFieldSI(m_t + g * h), e1 = reducedFieldSI(m_t + h);
+    const Vector zn = applyNADynamic(m_f, m_f1, en, nln).cwiseQuotient(m_W);
+    const Vector zn1 = f1Derivative(m_f, m_f1, en, nln.c);
+
+    using NL = TimeDependentOptions::NonLinear;
+    const bool extrapolate = m_opt.nonLinear == NL::extrapolate && m_tPrev >= 0 && m_t > m_tPrev;
+    const bool iterate = m_opt.nonLinear == NL::iterate || (m_opt.nonLinear == NL::extrapolate && !extrapolate);
+    auto guess = [&](double dt) {
+        NonLinearState nl = nln;
+        if (extrapolate)
+        {
+            const double w = dt / (m_t - m_tPrev);
+            nl.c = nln.c + w * (nln.c - m_nlPrev.c);
+            if (m_ee)
+            {
+                nl.A = nln.A + w * (nln.A - m_nlPrev.A);
+                nl.B = nln.B + w * (nln.B - m_nlPrev.B);
+            }
+        }
+        return nl;
+    };
+
+    // stage 1: trapezoidal rule over [t, t + g h]
+    const double a1 = 0.5 * g * h;
+    const Vector rhs1 = m_W.cwiseProduct(m_f + a1 * zn);
+    const Vector r1g = m_f1 + a1 * zn1;
+    NonLinearState nlg = guess(g * h);
+    Vector fg(m_n), f1g;
+    stageDynamic(a1, eg, rhs1, r1g, nlg, fg, f1g, iterate);
+    const Vector zg = (2.0 / (g * h)) * (fg - m_f) - zn;
+    const Vector zg1 = (2.0 / (g * h)) * (f1g - m_f1) - zn1;
+
+    // stage 2: BDF2 over [t, t + g h, t + h]
+    const Vector rhs2 = m_W.cwiseProduct(cg2 * fg - cn2 * m_f);
+    const Vector r12 = cg2 * f1g - cn2 * m_f1;
+    NonLinearState nl1 = extrapolate ? guess(h) : nlg;
+    Vector f1v(m_n), f11;
+    stageDynamic(d * h, e1, rhs2, r12, nl1, f1v, f11, iterate);
+
+    errNorm = 0.0;
+    if (m_opt.fixedStep <= 0 && !m_frozen)
+    {
+        const Vector z1 = (f1v - rhs2.cwiseQuotient(m_W)) / (d * h);
+        const Vector z11 = (f11 - r12) / (d * h);
+        Vector est = m_W.cwiseProduct((2.0 * k * h) * (zn / g - zg / (g * (1.0 - g)) + z1 / (1.0 - g)));
+        resolve(est);
+        Vector est1 = (2.0 * k * h) * (zn1 / g - zg1 / (g * (1.0 - g)) + z11 / (1.0 - g));
+        if (!est.allFinite() || !f1v.allFinite() || !est1.allFinite() || !f11.allFinite())
+        {
+            errNorm = std::numeric_limits<double>::infinity();
+            return false;
+        }
+        const double fmax = f1v.cwiseAbs().maxCoeff();
+        for (Grid::Index i = 0; i < m_n; ++i)
+        {
+            const double w = m_opt.rtol * std::max(std::abs(f1v[i]), std::abs(m_f[i])) + m_opt.atol * fmax;
+            errNorm = std::max(errNorm, std::abs(est[i]) / w);
+        }
+        // f1: filtered by its own implicit factor; weights from the f1 magnitude at the peak field
+        const Vector gq = fieldCoefficientNodes(nl1.c);
+        const double f1max = m_f1Scale.maxCoeff();
+        for (Grid::Index j = 1; j < m_n; ++j)
+        {
+            const double nu = m_N * SI::gamma * m_sqrtUNode[j] * m_uNode[j] / (3.0 * gq[j]);
+            const double w = m_opt.rtol * std::max({std::abs(f11[j]), std::abs(m_f1[j]), m_f1Scale[j]}) +
+                             m_opt.atol * f1max;
+            errNorm = std::max(errNorm, std::abs(est1[j] / (1.0 + d * h * nu)) / w);
+        }
+        if (!(errNorm <= 1.0))
+            return false;
+    }
+    if (!f1v.allFinite() || !f11.allFinite())
+        throw std::runtime_error("timeDependent: non-finite EEDF with fixed steps (or a frozen schedule) at t = " +
+                                 std::to_string(m_t) + " s; use smaller steps.");
+
+    const double nrm = norm(f1v);
+    m_diag.maxNormDrift = std::max(m_diag.maxNormDrift, std::abs(nrm - 1.0));
+    double pfOld = 0, pgOld = 0, e2Old = 0;
+    Vector fOld;
+    if (m_accumulate)
+    {
+        e2Old = en * en;
+        pfOld = currentFieldPower();
+        pgOld = -m_c * meanEnergy(m_f);
+        fOld = m_f;
+    }
+    m_cPrev = m_c;
+    m_tPrev = m_t;
+    m_nlPrev = nln;
+    const double cOld = m_c;
+    m_f = f1v / nrm;
+    m_f1 = f11 / nrm;
+    m_c = ciEff(m_f);
+    m_t += h;
+    if (m_opt.evolveElectronDensity && m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm)
+        m_ne *= std::exp(0.5 * h * m_N * (cOld + m_c));
+    if (m_accumulate)
+        accumulate(h, fOld, pfOld, pgOld, e2Old);
+    m_diag.lastStep = h;
+    m_diag.minEedf = std::min(m_diag.minEedf, m_f.minCoeff());
+    return true;
+}
+
 void TimeDependentBoltzmann::initialize()
 {
     const Grid &grid = m_ek.grid();
@@ -737,6 +1125,25 @@ void TimeDependentBoltzmann::initialize()
     m_f /= norm(m_f);
     m_c = ciEff(m_f);
     m_ne = m_wc.electronDensity();
+    double sa = 0, sw = 0, sphi = 0, soff = 0;
+    const bool harmonicStart = m_dynF1 && m_opt.initial == TimeDependentOptions::Initial::steadyState &&
+                               m_opt.initialReducedField == "rms" && m_waveform->sinusoid(sa, sw, sphi, soff) &&
+                               soff == 0.0;
+    if (harmonicStart)
+    {
+        // LoKI-B's HF steady state at E_rms and omega, and the harmonic f1: the periodic state when omega >> nu_u
+        Log<Message>::Notify("timeDependent: initial state is the HF steady solution at E_rms = ",
+                             std::abs(sa) / std::sqrt(2.0), " Td, f = ", sw / (2 * Constant::pi), " Hz.");
+        m_f = steadyStateHF(m_f, std::abs(sa) / std::sqrt(2.0) * SI::Townsend, sw / m_N);
+        m_c = ciEff(m_f);
+    }
+    if (m_dynF1)
+    {
+        m_f1 = harmonicStart ? harmonicF1(m_f, sa * SI::Townsend, sw, sphi, 0.0, m_c)
+                             : quasiStaticF1(m_f, reducedFieldSI(0.0), m_c);
+        const double emax = m_waveform->peak(0.0, horizon()) * SI::Townsend;
+        m_f1Scale = quasiStaticF1(m_f, emax, m_c).cwiseAbs();
+    }
     m_t = 0.0;
     m_tPrev = -1.0;
     m_nextSample = 0;
@@ -854,12 +1261,15 @@ void TimeDependentBoltzmann::sample()
     m_ek.CIEff = m_c;
     prepareOutputState();
     m_ek.evaluatePower();
+    if (m_dynF1)
+        setFieldPower(m_ek.power, currentFieldPower());
     m_ek.mixture.collision_data().evaluateRateCoefficients(grid, m_ek.eedf);
     m_ek.evaluateSwarmParameters();
 
     const NonLinearState nl = nonLinearState(m_f);
     evaluateField(nl.c);
-    const Vector z = applyNA(m_f, reducedField2(m_t), nl).cwiseQuotient(m_W);
+    const Vector z = (m_dynF1 ? applyNADynamic(m_f, m_f1, reducedFieldSI(m_t), nl)
+                              : applyNA(m_f, reducedField2(m_t), nl)).cwiseQuotient(m_W);
     const double depsdt = grid.getCells().array().pow(1.5).matrix().cwiseProduct(grid.duCells()).dot(z);
     const Power &p = m_ek.power;
     const double residual = (depsdt - m_N * p.balance) / (m_N * p.reference);
@@ -894,9 +1304,14 @@ void TimeDependentBoltzmann::emitState(const std::string &jobFolder)
     m_ek.CIEff = m_c;
     prepareOutputState();
     m_ek.evaluatePower();
+    if (m_dynF1)
+        setFieldPower(m_ek.power, currentFieldPower());
     m_ek.mixture.collision_data().evaluateRateCoefficients(grid, m_ek.eedf);
     m_ek.evaluateSwarmParameters();
     m_ek.evaluateFirstAnisotropy();
+    if (m_dynF1)
+        for (Grid::Index k = 0; k < m_n; ++k)
+            m_ek.firstAnisotropy[k] = 0.5 * (m_f1[k] + m_f1[k + 1]);  // faces -> cells
     m_ek.obtainedNewEedf.emit(grid, m_ek.eedf, m_wc, m_ek.power, m_ek.mixture.collision_data(), m_ek.swarmParameters,
                               &m_ek.firstAnisotropy);
 }
@@ -924,7 +1339,7 @@ void TimeDependentBoltzmann::accumulate(double h, const Vector &fOld, double pfO
     m_accT += h;
     m_accF += (0.5 * h) * (fOld + m_f);
     m_accC += 0.5 * h * (ciEff(fOld) + m_c);
-    m_accPfield += 0.5 * h * (pfOld + fieldPower(m_f, e2));
+    m_accPfield += 0.5 * h * (pfOld + (m_dynF1 ? currentFieldPower() : fieldPower(m_f, e2)));
     m_accPgrowth += 0.5 * h * (pgOld - m_c * meanEnergy(m_f));
     m_accE2 += 0.5 * h * (e2Old + e2);
 }

@@ -7,6 +7,8 @@
  *      d<eps>/dt = P(t) - nu_u (<eps> - 3/2 kTg),  P = e (E/N)^2 N / (m nu0),  nu_u = (2m/M) N nu0.
  *  1. Field step 3 -> 5 Td from the steady state at 3 Td: <eps> at t = 1/nu_u (mid relaxation).
  *  2. E/N = 5 sin(omega t) Td, 2 omega = nu_u, periodic steady state: cycle-averaged <eps> = 3/2 kTg + P0/(2 nu_u).
+ *  3. Dynamic f1, E/N = 5 sqrt(2) sin(omega t) Td with omega = nu (momentum transfer): the f1 lag halves the heating,
+ *     cycle-averaged <eps> = 3/2 kTg + (P0/2) nu^2/(nu^2 + omega^2) / nu_u (exact for constant nu).
  *  The tolerance (3e-3) covers the energy discretization of the steady operators (1e-3 on this grid).
  */
 
@@ -117,6 +119,20 @@ int main()
         std::clog << "sinusoid: cycle-averaged <eps> = " << r.at("td_cycleAverage") << " eV, exact " << exact << " eV"
                   << std::endl;
         test_expr(r.count("td_cycleAverage") == 1);
+        test_expr(std::abs(r.at("td_cycleAverage") / exact - 1) < 3e-3);
+    }
+    // 3. dynamic f1 at omega = nu
+    {
+        const double nu = N * nu0, freq = nu / (2 * loki::Constant::pi), E0 = 5 * std::sqrt(2.0);
+        std::ostringstream td;
+        td << "  timeDependent:\n    isOn: true\n    anisotropy: dynamic\n    reducedField:\n      type: sinusoid\n"
+           << "      amplitude: " << std::setprecision(12) << E0 << "\n      frequency: " << freq
+           << "\n    initialCondition:\n      type: steadyState\n      reducedField: rms\n    periodic:\n"
+           << "      tol: 1e-6\n";
+        const auto r = run(setup(dir, E0, td.str()));
+        const double exact = 1.5 * kTg + 0.5 * P(E0) * 0.5 / nuU;
+        std::clog << "dynamic f1, omega = nu: cycle-averaged <eps> = " << r.at("td_cycleAverage") << " eV, exact " << exact
+                  << " eV" << std::endl;
         test_expr(std::abs(r.at("td_cycleAverage") / exact - 1) < 3e-3);
     }
     fs::remove_all(dir);

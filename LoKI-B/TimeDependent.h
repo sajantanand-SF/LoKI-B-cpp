@@ -52,6 +52,8 @@ public:
     virtual double peak(double t0, double t1) const;
     /// RMS of E/N over one period (periodic) or over [t0,t1]
     virtual double rms(double t0, double t1) const;
+    /// for a sinusoid offset + amplitude sin(omega t + phase): true and its parameters (E/N in Td)
+    virtual bool sinusoid(double &amplitude, double &omega, double &phase, double &offset) const { return false; }
     static std::unique_ptr<Waveform> create(const json_type &cnf, const std::filesystem::path &basePath);
 };
 
@@ -77,6 +79,16 @@ struct TimeDependentOptions
     double initialTemperature = -1.0;
 
     bool gridFromPeakField = true;
+
+    /** The first anisotropy f1 (on the cell faces, where the field flux lives):
+     *  quasiStatic: f1 = -(E/N)/Omega_c df/du at every instant (LoKI-B MATLAB; valid for field changes slower than
+     *               1/nu_m, i.e. omega << nu_m);
+     *  dynamic:     f1 is an unknown with (1/(N gamma sqrt(u))) df1/dt + Omega_c f1 = -(E/N) df/du, integrated with
+     *               f; it is eliminated per implicit stage, so the cost is that of the quasi-static scheme. For a
+     *               sinusoid at omega >~ nu_m this gives the HF heating 1/(Omega_c + omega^2/(N^2 gamma^2 u Omega_c)).
+     */
+    enum class Anisotropy { quasiStatic, dynamic };
+    Anisotropy anisotropy = Anisotropy::quasiStatic;
 
     double finalTime = 0.0;  // required unless periodic
     std::vector<double> sampleTimes;
@@ -146,6 +158,8 @@ public:
     double CIEff() const { return m_c; }
     double electronDensity() const { return m_ne; }
     double meanEnergy() const { return meanEnergy(m_f); }
+    /// f1 on the cell faces (dynamic anisotropy; empty otherwise)
+    const Vector &firstAnisotropyNodes() const { return m_f1; }
 
     /** Coupling hooks, to be called between advance() calls (e.g. by a chemistry model).
      *  setPopulations: new populations of states, by state id (e.g. {"He(1S1)", 0.999}, {"He(2S3)", 1e-3}); the
@@ -191,6 +205,31 @@ private:
     /// implicit stage: (W - a N A(nl)) x = rhs, with nl = nl(x) iterated if iterate
     void stage(double a, double EoN2, const Vector &rhs, NonLinearState &nl, Vector &x, bool iterate);
     void prepareOutputState();
+
+    // dynamic anisotropy
+    /// g_j = (u_j/3)/Omega_j on the faces (the field coefficient at E/N = 1), 0 on the boundary faces
+    Vector fieldCoefficientNodes(double c) const;
+    /// D_j = (f_j - f_{j-1})/du_j on the interior faces (0 on the boundary faces)
+    Vector gradientNodes(const Vector &f) const;
+    /// (phi_{k+1} - phi_k)/du_k
+    Vector divergence(const Vector &phi) const;
+    /// df1/dt = N gamma sqrt(u) (-Omega f1 - e D)
+    Vector f1Derivative(const Vector &f, const Vector &f1, double e, double c) const;
+    /// N*A*f with the field term from f1 (dynamic anisotropy); e = E/N (V m^2, signed)
+    Vector applyNADynamic(const Vector &f, const Vector &f1, double e, const NonLinearState &nl) const;
+    double fieldPowerDynamic(const Vector &f1, double e) const;
+    double reducedFieldSI(double t) const;
+    void stageDynamic(double a, double e, const Vector &rhs0, const Vector &r1, NonLinearState &nl, Vector &x0,
+                      Vector &x1, bool iterate);
+    void solveSystemDynamic(double a, double e, const Vector &r1, const NonLinearState &nl, const Vector &rhs0,
+                            Vector &x0, Vector &x1);
+    bool stepDynamic(double h, double &errNorm);
+    double currentFieldPower() const;
+    Vector quasiStaticF1(const Vector &f, double e, double c) const;
+    /// steady EEDF with LoKI-B's HF field operator (RMS field ErmsSI, omega/N = WoN), starting from f
+    Vector steadyStateHF(const Vector &f, double ErmsSI, double WoN);
+    /// the harmonic (periodic) f1 at time t for f0 = f under E/N = A sin(omega t + phase) (A in V m^2)
+    Vector harmonicF1(const Vector &f, double A, double omega, double phase, double t, double c) const;
     bool step(double h, double &errNorm);
     void sample();
     void openOutput();
@@ -235,6 +274,10 @@ private:
     double m_cPrev = 0.0, m_tPrev = -1.0;  // for NonLinear::extrapolate
     NonLinearState m_nlPrev;                // nonlinear coefficients at m_tPrev
     bool m_ee = false;
+    bool m_dynF1 = false;
+    Vector m_f1;                     // f1 on the n+1 faces (dynamic anisotropy)
+    Vector m_uNode, m_sqrtUNode, m_dn, m_dc;  // face energies, sqrt, face spacing (cell centre to centre), cell widths
+    Vector m_f1Scale;                // per-face f1 magnitude for the error weights
     double m_ne = 0.0, m_dlnneDt = 0.0;
 
     // time integrals (trapezoidal rule over accepted steps), used for period averages
