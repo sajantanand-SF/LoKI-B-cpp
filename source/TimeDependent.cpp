@@ -239,8 +239,12 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
         electronDensity = ElectronDensity::swarm;
     else if (ne == "constant")
         electronDensity = ElectronDensity::constant;
+    else if (ne == "external")
+        electronDensity = ElectronDensity::external;
     else
-        throw std::runtime_error("timeDependent: electronDensity must be 'swarm' or 'constant', not '" + ne + "'.");
+        throw std::runtime_error("timeDependent: electronDensity must be 'swarm', 'constant' or 'external', not '" + ne +
+                                 "'.");
+    evolveElectronDensity = getBool(cnf, "evolveElectronDensity", false);
 
     if (cnf.contains("initialCondition"))
     {
@@ -348,6 +352,7 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
             throw std::runtime_error("timeDependent: integrator.nonLinear must be 'iterate', 'lag' or 'extrapolate'.");
         maxNonLinearIter = static_cast<unsigned>(getDouble(ig, "maxNonLinearIterations", maxNonLinearIter));
         nonLinearTol = getDouble(ig, "nonLinearTolerance", nonLinearTol);
+        eeTol = getDouble(ig, "eeTolerance", eeTol);
         maxSteps = static_cast<unsigned long>(getDouble(ig, "maxSteps", double(maxSteps)));
     }
 }
@@ -374,8 +379,6 @@ void TimeDependentBoltzmann::checkSupported() const
     if (m_wc.reducedExcFreqSI() != 0.0)
         throw std::runtime_error("timeDependent: excitationFrequency must be 0; the field oscillation is "
                                  "resolved in time through timeDependent.reducedField.");
-    if (m_ek.eeOperator)
-        throw std::runtime_error("timeDependent: electron-electron collisions are not supported yet.");
     if (m_ek.growthModelType == GrowthModelType::spatial &&
         m_ek.ionizationOperator.ionizationOperatorType != IonizationOperatorType::conservative)
         throw std::runtime_error("timeDependent: spatial growth is not available in the time-dependent mode; "
@@ -402,6 +405,9 @@ void TimeDependentBoltzmann::assembleFixedOperators()
 {
     const Grid &grid = m_ek.grid();
     m_n = grid.nCells();
+    m_ee = static_cast<bool>(m_ek.eeOperator);
+    if (m_ee)
+        m_ek.eeOperator->initialize(grid);  // the a matrix of the e-e operator for the final grid
     m_sqrtU = grid.getCells().cwiseSqrt();
     m_W = m_sqrtU / SI::gamma;
     m_numberWeights = m_sqrtU.cwiseProduct(grid.duCells());
@@ -454,13 +460,31 @@ void TimeDependentBoltzmann::assembleFixedOperators()
                          m_solver == Solver::tdma ? "TDMA" : (m_solver == Solver::hessenberg ? "Hessenberg" : "LU"),
                          ", growth ", m_nonConservative ? "non-conservative (temporal)" : "none (conservative)",
                          ", electronDensity ",
-                         m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm ? "swarm" : "constant");
+                         m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm
+                             ? "swarm"
+                             : (m_opt.electronDensity == TimeDependentOptions::ElectronDensity::constant ? "constant"
+                                                                                                         : "external"),
+                         m_ee ? ", e-e collisions on" : "");
+}
+
+double TimeDependentBoltzmann::fieldGrowthTerm(double c) const
+{
+    using ED = TimeDependentOptions::ElectronDensity;
+    switch (m_opt.electronDensity)
+    {
+    case ED::swarm:
+        return m_nonConservative ? c : 0.0;
+    case ED::constant:
+        return 0.0;
+    case ED::external:
+        return m_dlnneDt / m_N;
+    }
+    return 0.0;
 }
 
 void TimeDependentBoltzmann::evaluateField(double c)
 {
-    const double cEff =
-        (m_nonConservative && m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm) ? c : 0.0;
+    const double cEff = fieldGrowthTerm(c);
     if (!(cEff == m_Fc))
     {
         m_ek.fieldOperator.evaluate(m_ek.grid(), m_ek.mixture.collision_data().totalCrossSection(), 1.0, 0.0, cEff, m_F);
@@ -468,18 +492,41 @@ void TimeDependentBoltzmann::evaluateField(double c)
     }
 }
 
-Vector TimeDependentBoltzmann::applyNA(const Vector &f, double EoN2, double c) const
+TimeDependentBoltzmann::NonLinearState TimeDependentBoltzmann::nonLinearState(const Vector &f) const
 {
-    // evaluateField is non-const (it caches F); callers make sure F matches c
+    NonLinearState nl;
+    nl.c = ciEff(f);
+    if (m_ee)
+    {
+        const Vector fn = f / norm(f);
+        m_ek.eeOperator->update_g_ee_AB(m_ek.grid(), fn, m_ne, m_N);
+        nl.A = m_ek.eeOperator->A();
+        nl.B = m_ek.eeOperator->B();
+    }
+    return nl;
+}
+
+Vector TimeDependentBoltzmann::applyNA(const Vector &f, double EoN2, const NonLinearState &nl) const
+{
+    // evaluateField is non-const (it caches F); callers make sure F matches nl.c
     Vector r = m_A0 * f + EoN2 * (m_F * f);
     if (m_nonConservative)
-        r -= (c / SI::gamma) * m_sqrtU.cwiseProduct(f);
+        r -= (nl.c / SI::gamma) * m_sqrtU.cwiseProduct(f);
+    if (m_ee)
+        for (Grid::Index k = 0; k < m_n; ++k)
+        {
+            r[k] -= (nl.A[k] + nl.B[k]) * f[k];
+            if (k > 0)
+                r[k] += nl.A[k - 1] * f[k - 1];
+            if (k < m_n - 1)
+                r[k] += nl.B[k + 1] * f[k + 1];
+        }
     return m_N * r;
 }
 
-void TimeDependentBoltzmann::solveSystem(double a, double EoN2, double c, Vector &x)
+void TimeDependentBoltzmann::solveSystem(double a, double EoN2, const NonLinearState &nl, Vector &x)
 {
-    evaluateField(c);
+    evaluateField(nl.c);
     const double s = -a * m_N;
     m_work.noalias() = s * m_A0;
     for (int k = 0; k < m_F.outerSize(); ++k)
@@ -489,7 +536,16 @@ void TimeDependentBoltzmann::solveSystem(double a, double EoN2, double c, Vector
     {
         m_work(k, k) += m_W[k];
         if (m_nonConservative)
-            m_work(k, k) += a * m_N * (c / SI::gamma) * m_sqrtU[k];
+            m_work(k, k) += a * m_N * (nl.c / SI::gamma) * m_sqrtU[k];
+        if (m_ee)
+        {
+            // same discretization as ElectronElectronOperator::discretizeTerm
+            m_work(k, k) -= s * (nl.A[k] + nl.B[k]);
+            if (k > 0)
+                m_work(k, k - 1) += s * nl.A[k - 1];
+            if (k < m_n - 1)
+                m_work(k, k + 1) += s * nl.B[k + 1];
+        }
     }
     if (m_solver == Solver::lu)
         m_lu.compute(m_work);
@@ -513,28 +569,41 @@ void TimeDependentBoltzmann::resolve(Vector &x)
     }
 }
 
-void TimeDependentBoltzmann::stage(double a, double EoN2, const Vector &rhs, double &c, Vector &x, bool iterate)
+void TimeDependentBoltzmann::stage(double a, double EoN2, const Vector &rhs, NonLinearState &nl, Vector &x,
+                                   bool iterate)
 {
-    if (!m_nonConservative || !iterate)
-    {
-        x = rhs;
-        solveSystem(a, EoN2, c, x);
+    x = rhs;
+    solveSystem(a, EoN2, nl, x);
+    if (!iterate || (!m_nonConservative && !m_ee))
         return;
-    }
-    for (unsigned it = 0;; ++it)
+    // Picard iteration on the nonlinear coefficients
+    for (unsigned it = 1;; ++it)
     {
-        x = rhs;
-        solveSystem(a, EoN2, c, x);
-        const double cNew = ciEff(x);
-        if (std::abs(cNew - c) <= m_opt.nonLinearTol * std::abs(cNew) || cNew == c)
+        if (!x.allFinite())
+            break;  // the step will be rejected
+        const NonLinearState nlNew = nonLinearState(x);
+        bool done = std::abs(nlNew.c - nl.c) <= m_opt.nonLinearTol * std::abs(nlNew.c) || nlNew.c == nl.c;
+        nl = nlNew;
+        const Vector xOld = x;
+        if (done && !m_ee)
             break;
-        if (it + 1 >= m_opt.maxNonLinearIter)
+        x = rhs;
+        solveSystem(a, EoN2, nl, x);
+        if (m_ee)
         {
-            Log<Message>::Warning("timeDependent: CIEff iteration did not converge at t = ", m_t, " s (|dc/c| = ",
-                                  std::abs(cNew - c) / std::abs(cNew), ").");
+            const double fmax = x.cwiseAbs().maxCoeff();
+            double dx = 0;
+            for (Grid::Index i = 0; i < m_n; ++i)
+                dx = std::max(dx, std::abs(x[i] - xOld[i]) / (std::abs(x[i]) + m_opt.atol * fmax));
+            done = done && dx <= m_opt.eeTol;
+            if (done)
+                break;
+        }
+        if (it >= m_opt.maxNonLinearIter)
+        {
+            Log<Message>::Warning("timeDependent: nonlinear (CIEff/e-e) iteration did not converge at t = ", m_t, " s.");
             break;
         }
-        c = cNew;
     }
 }
 
@@ -544,27 +613,41 @@ bool TimeDependentBoltzmann::step(double h, double &errNorm)
     static const double d = (1.0 - g) / (2.0 - g);
     static const double k = (-3.0 * g * g + 4.0 * g - 2.0) / (12.0 * (2.0 - g));
 
-    evaluateField(m_c);
-    const Vector zn = applyNA(m_f, reducedField2(m_t), m_c).cwiseQuotient(m_W);
+    const NonLinearState nln = nonLinearState(m_f);
+    evaluateField(nln.c);
+    const Vector zn = applyNA(m_f, reducedField2(m_t), nln).cwiseQuotient(m_W);
 
-    // CIEff in the stages: iterated, lagged, or extrapolated from the last two accepted steps
+    // nonlinear coefficients in the stages: iterated, lagged, or extrapolated from the last two accepted steps
     using NL = TimeDependentOptions::NonLinear;
     const bool extrapolate = m_opt.nonLinear == NL::extrapolate && m_tPrev >= 0 && m_t > m_tPrev;
     const bool iterate = m_opt.nonLinear == NL::iterate || (m_opt.nonLinear == NL::extrapolate && !extrapolate);
-    const double slope = extrapolate ? (m_c - m_cPrev) / (m_t - m_tPrev) : 0.0;
+    auto guess = [&](double dt) {
+        NonLinearState nl = nln;
+        if (extrapolate)
+        {
+            const double w = dt / (m_t - m_tPrev);
+            nl.c = nln.c + w * (nln.c - m_nlPrev.c);
+            if (m_ee)
+            {
+                nl.A = nln.A + w * (nln.A - m_nlPrev.A);
+                nl.B = nln.B + w * (nln.B - m_nlPrev.B);
+            }
+        }
+        return nl;
+    };
 
     // stage 1: trapezoidal rule over [t, t + g h]
     const Vector rhs1 = m_W.cwiseProduct(m_f + (0.5 * g * h) * zn);
-    double cg = m_c + slope * g * h;
+    NonLinearState nlg = guess(g * h);
     Vector fg(m_n);
-    stage(0.5 * g * h, reducedField2(m_t + g * h), rhs1, cg, fg, iterate);
+    stage(0.5 * g * h, reducedField2(m_t + g * h), rhs1, nlg, fg, iterate);
     const Vector zg = (2.0 / (g * h)) * (fg - m_f) - zn;
 
     // stage 2: BDF2 over [t, t + g h, t + h]
     const Vector rhs2 = m_W.cwiseProduct(fg / (g * (2.0 - g)) - ((1.0 - g) * (1.0 - g) / (g * (2.0 - g))) * m_f);
-    double c1 = extrapolate ? m_c + slope * h : cg;
+    NonLinearState nl1 = extrapolate ? guess(h) : nlg;
     Vector f1(m_n);
-    stage(d * h, reducedField2(m_t + h), rhs2, c1, f1, iterate);
+    stage(d * h, reducedField2(m_t + h), rhs2, nl1, f1, iterate);
 
     errNorm = 0.0;
     if (m_opt.fixedStep <= 0 && !m_frozen)
@@ -573,6 +656,11 @@ bool TimeDependentBoltzmann::step(double h, double &errNorm)
         // local error estimate (Bank et al. 1985; Hosea and Shampine 1996), filtered by the stage-2 matrix
         Vector est = m_W.cwiseProduct((2.0 * k * h) * (zn / g - zg / (g * (1.0 - g)) + z1 / (1.0 - g)));
         resolve(est);
+        if (!est.allFinite() || !f1.allFinite())
+        {
+            errNorm = std::numeric_limits<double>::infinity();  // e.g. a diverged nonlinear iteration: reject
+            return false;
+        }
         const double fmax = f1.cwiseAbs().maxCoeff();
         for (Grid::Index i = 0; i < m_n; ++i)
         {
@@ -583,6 +671,9 @@ bool TimeDependentBoltzmann::step(double h, double &errNorm)
             return false;
     }
 
+    if (!f1.allFinite())
+        throw std::runtime_error("timeDependent: non-finite EEDF with fixed steps (or a frozen schedule) at t = " +
+                                 std::to_string(m_t) + " s; use smaller steps.");
     const double nrm = norm(f1);
     m_diag.maxNormDrift = std::max(m_diag.maxNormDrift, std::abs(nrm - 1.0));
     double pfOld = 0, pgOld = 0, e2Old = 0;
@@ -597,9 +688,13 @@ bool TimeDependentBoltzmann::step(double h, double &errNorm)
     }
     m_cPrev = m_c;
     m_tPrev = m_t;
+    m_nlPrev = nln;
+    const double cOld = m_c;
     m_f = f1 / nrm;
     m_c = ciEff(m_f);
     m_t += h;
+    if (m_opt.evolveElectronDensity && m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm)
+        m_ne *= std::exp(0.5 * h * m_N * (cOld + m_c));
     if (m_accumulate)
         accumulate(h, fOld, pfOld, pgOld, e2Old);
     m_diag.lastStep = h;
@@ -641,6 +736,7 @@ void TimeDependentBoltzmann::initialize()
     }
     m_f /= norm(m_f);
     m_c = ciEff(m_f);
+    m_ne = m_wc.electronDensity();
     m_t = 0.0;
     m_tPrev = -1.0;
     m_nextSample = 0;
@@ -653,8 +749,9 @@ void TimeDependentBoltzmann::initialize()
         m_h = m_opt.initialStep;
     else
     {
-        evaluateField(m_c);
-        const Vector z = applyNA(m_f, reducedField2(0.0), m_c).cwiseQuotient(m_W);
+        const NonLinearState nl = nonLinearState(m_f);
+        evaluateField(nl.c);
+        const Vector z = applyNA(m_f, reducedField2(0.0), nl).cwiseQuotient(m_W);
         const double fmax = m_f.cwiseAbs().maxCoeff();
         double r = 0;
         for (Grid::Index i = 0; i < m_n; ++i)
@@ -699,6 +796,11 @@ void TimeDependentBoltzmann::advance(double tEnd)
             throw std::runtime_error("timeDependent: maxSteps exceeded.");
         if (ok && m_recordSchedule)
             m_schedule.push_back(m_t - m_periodStart);
+        if (ok && m_recordFirstStep)
+        {
+            m_hPeriodStart = h;
+            m_recordFirstStep = false;
+        }
         if (m_opt.fixedStep <= 0 && !m_frozen)
         {
             const double fac = std::clamp(err > 0 ? 0.9 * std::pow(err, -1.0 / 3.0) : 5.0, 0.2, 5.0);
@@ -732,7 +834,7 @@ void TimeDependentBoltzmann::openOutput()
                  << " eV\n";
     m_timeSeries << "# columns: t(s) E/N(Td) meanEnergy(eV) Te(eV) redMob(1/(msV)) redDiff(1/(ms)) "
                     "redTownsend(m2) CIEff(m3/s) Pfield Pelastic Pcar Pinelastic Psuperelastic PeDensGrowth "
-                    "Pbalance(eVm3/s) depsdt(eV/s) powerResidual minEedf steps rejected solves lastStep(s)\n";
+                    "Pbalance(eVm3/s) depsdt(eV/s) powerResidual minEedf steps rejected solves lastStep(s) ne(m-3)\n";
     m_timeSeries << std::scientific << std::setprecision(10);
     m_rates.open(m_outFolder / "rateCoefficients_t.txt");
     m_rates << "# columns: t(s) E/N(Td), then for each collision the inelastic and superelastic rate coefficients "
@@ -750,15 +852,14 @@ void TimeDependentBoltzmann::sample()
     m_wc.updateReducedField(EoN);
     m_ek.eedf = m_f;
     m_ek.CIEff = m_c;
-    const double cEff =
-        (m_nonConservative && m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm) ? m_c : 0.0;
-    m_ek.fieldOperator.evaluate(grid, m_ek.mixture.collision_data().totalCrossSection(), 1.0, 0.0, cEff);
+    prepareOutputState();
     m_ek.evaluatePower();
     m_ek.mixture.collision_data().evaluateRateCoefficients(grid, m_ek.eedf);
     m_ek.evaluateSwarmParameters();
 
-    evaluateField(m_c);
-    const Vector z = applyNA(m_f, reducedField2(m_t), m_c).cwiseQuotient(m_W);
+    const NonLinearState nl = nonLinearState(m_f);
+    evaluateField(nl.c);
+    const Vector z = applyNA(m_f, reducedField2(m_t), nl).cwiseQuotient(m_W);
     const double depsdt = grid.getCells().array().pow(1.5).matrix().cwiseProduct(grid.duCells()).dot(z);
     const Power &p = m_ek.power;
     const double residual = (depsdt - m_N * p.balance) / (m_N * p.reference);
@@ -771,7 +872,7 @@ void TimeDependentBoltzmann::sample()
                      << p.elasticNet << ' ' << p.carNet << ' ' << p.inelastic << ' ' << p.superelastic << ' '
                      << p.eDensGrowth << ' ' << p.balance << ' ' << depsdt << ' ' << residual << ' '
                      << m_f.minCoeff() << ' ' << m_diag.steps << ' ' << m_diag.rejected << ' ' << m_diag.solves << ' '
-                     << m_diag.lastStep << '\n';
+                     << m_diag.lastStep << ' ' << m_ne << '\n';
         m_timeSeries.flush();
         m_rates << m_t << ' ' << EoN;
         for (const auto &rc : m_ek.mixture.collision_data().rateCoefficients())
@@ -791,9 +892,7 @@ void TimeDependentBoltzmann::emitState(const std::string &jobFolder)
     m_wc.updateReducedField(EoN);
     m_ek.eedf = m_f;
     m_ek.CIEff = m_c;
-    const double cEff =
-        (m_nonConservative && m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm) ? m_c : 0.0;
-    m_ek.fieldOperator.evaluate(grid, m_ek.mixture.collision_data().totalCrossSection(), 1.0, 0.0, cEff);
+    prepareOutputState();
     m_ek.evaluatePower();
     m_ek.mixture.collision_data().evaluateRateCoefficients(grid, m_ek.eedf);
     m_ek.evaluateSwarmParameters();
@@ -941,7 +1040,17 @@ void TimeDependentBoltzmann::advancePeriod(double t0, double T)
         for (unsigned j = 1; j < m_opt.stepsPerPeriod; ++j)
             m_extraStops.push_back(t0 + T * j / m_opt.stepsPerPeriod);
         if (m_opt.fixedStep <= 0)
-            m_h = T / m_opt.stepsPerPeriod;
+        {
+            // the same first step in every period (a deterministic step sequence for a periodic state): the first
+            // accepted step of the first period, which starts from T/stepsPerPeriod
+            if (m_hPeriodStart <= 0)
+            {
+                m_h = T / m_opt.stepsPerPeriod;
+                m_recordFirstStep = true;
+            }
+            else
+                m_h = m_hPeriodStart;
+        }
         m_schedule.clear();
         m_recordSchedule = m_opt.fixedStep <= 0;
     }
@@ -964,9 +1073,7 @@ void TimeDependentBoltzmann::writeCycleAverage(unsigned periods, double t0, doub
     m_wc.updateReducedField(erms);
     m_ek.eedf = fbar;
     m_ek.CIEff = cbar;
-    const double cEff =
-        (m_nonConservative && m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm) ? cbar : 0.0;
-    m_ek.fieldOperator.evaluate(grid, m_ek.mixture.collision_data().totalCrossSection(), 1.0, 0.0, cEff);
+    prepareOutputState();
     m_ek.evaluatePower();
     Power &pw = m_ek.power;
     pw.field = pfield;
@@ -994,6 +1101,46 @@ void TimeDependentBoltzmann::writeCycleAverage(unsigned periods, double t0, doub
     Log<Message>::Notify("timeDependent cycle average:\n", os.str());
     if (!m_outFolder.empty())
         std::ofstream(m_outFolder / "cycleAverage.txt") << os.str();
+}
+
+void TimeDependentBoltzmann::prepareOutputState()
+{
+    // the field operator (g) and e-e coefficients that LoKI-B's power evaluation uses, for m_ek.eedf and m_ek.CIEff
+    m_ek.fieldOperator.evaluate(m_ek.grid(), m_ek.mixture.collision_data().totalCrossSection(), 1.0, 0.0,
+                                fieldGrowthTerm(m_ek.CIEff));
+    if (m_ee)
+        m_ek.eeOperator->update_g_ee_AB(m_ek.grid(), m_ek.eedf, m_ne, m_N);
+}
+
+void TimeDependentBoltzmann::setPopulations(const std::map<std::string, double> &populations)
+{
+    auto &composition = m_ek.mixture.composition();
+    for (const auto &[id, pop] : populations)
+    {
+        Gas::State *state = composition.findStateById(id);
+        if (!state)
+            throw std::runtime_error("timeDependent::setPopulations: unknown state '" + id + "'.");
+        state->setPopulation(pop);
+    }
+    composition.checkPopulations();
+    composition.evaluateReducedDensities();
+    m_ek.evaluateMatrix();
+    assembleFixedOperators();
+    m_c = ciEff(m_f);
+    m_tPrev = -1.0;  // no extrapolation across the change
+}
+
+void TimeDependentBoltzmann::setElectronDensity(double ne, double dlnneDt)
+{
+    m_ne = ne;
+    m_dlnneDt = dlnneDt;
+    m_tPrev = -1.0;
+}
+
+std::vector<RateCoefficient> TimeDependentBoltzmann::rateCoefficients()
+{
+    m_ek.mixture.collision_data().evaluateRateCoefficients(m_ek.grid(), m_f);
+    return m_ek.mixture.collision_data().rateCoefficients();
 }
 
 void TimeDependentBoltzmann::run()

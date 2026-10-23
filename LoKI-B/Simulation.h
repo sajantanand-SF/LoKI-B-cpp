@@ -86,6 +86,8 @@ public:
     void run();
     const WorkingConditions& workingConditions() const { return m_workingConditions; }
     ElectronKinetics::ResultEvent& obtainedResults() { return m_obtainedResults; }
+    /// the time-dependent solver (nullptr unless electronKinetics.timeDependent.isOn)
+    TimeDependentBoltzmann* timeDependent() { return m_timeDependent.get(); }
 private:
     void initializeJobs(const json_type &cnf, bool useReducedFieldParameter);
     WorkingConditions m_workingConditions;
