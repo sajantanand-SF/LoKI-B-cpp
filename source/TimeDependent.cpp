@@ -383,6 +383,13 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
         nonLinearTol = getDouble(ig, "nonLinearTolerance", nonLinearTol);
         eeTol = getDouble(ig, "eeTolerance", eeTol);
         maxSteps = static_cast<unsigned long>(getDouble(ig, "maxSteps", double(maxSteps)));
+        const std::string ls = getString(ig, "linearSolver", "auto");
+        if (ls == "lu")
+            linearSolver = LinearSolver::lu;
+        else if (ls != "auto")
+            throw std::runtime_error("timeDependent: integrator.linearSolver must be 'auto' or 'lu'.");
+        krylovTol = getDouble(ig, "krylovTolerance", krylovTol);
+        krylovMaxIter = static_cast<unsigned>(getDouble(ig, "krylovMaxIterations", krylovMaxIter));
     }
 }
 
@@ -488,12 +495,19 @@ void TimeDependentBoltzmann::assembleFixedOperators()
 
     const auto bw = calculateBandwidth(m_A0);
     const auto lower = std::min<Matrix::Index>(bw.first, -1), upper = std::max<Matrix::Index>(bw.second, 1);
-    m_solver = (lower == -1 && upper == 1) ? Solver::tdma : (lower == -1 ? Solver::hessenberg : Solver::lu);
+    m_solver = (lower == -1 && upper == 1)
+                   ? Solver::tdma
+                   : (lower == -1 ? Solver::hessenberg
+                                  : (m_opt.linearSolver == TimeDependentOptions::LinearSolver::lu ? Solver::lu
+                                                                                                  : Solver::krylov));
     m_work.resize(m_n, m_n);
     m_hws.resize(m_n);
     Log<Message>::Notify("timeDependent: ", m_n, " cells, uMax = ", grid.uMax(), " eV, bandwidth [", lower, ",", upper,
                          "], solver ",
-                         m_solver == Solver::tdma ? "TDMA" : (m_solver == Solver::hessenberg ? "Hessenberg" : "LU"),
+                         m_solver == Solver::tdma
+                             ? "TDMA"
+                             : (m_solver == Solver::hessenberg ? "Hessenberg"
+                                                               : (m_solver == Solver::lu ? "LU" : "GMRES (Hessenberg-preconditioned)")),
                          ", growth ", m_nonConservative ? "non-conservative (temporal)" : "none (conservative)",
                          ", electronDensity ",
                          m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm
@@ -583,6 +597,7 @@ void TimeDependentBoltzmann::solveSystem(double a, double EoN2, const NonLinearS
                 m_work(k, k + 1) += s * nl.B[k + 1];
         }
     }
+    m_luCurrent = false;
     if (m_solver == Solver::lu)
         m_lu.compute(m_work);
     resolve(x);
@@ -602,7 +617,88 @@ void TimeDependentBoltzmann::resolve(Vector &x)
     case Solver::lu:
         x = m_lu.solve(x);
         break;
+    case Solver::krylov:
+        solveKrylov(x);
+        break;
     }
+}
+
+unsigned gmresHessenberg(const Matrix &M, Vector &b, double tol, unsigned maxIter, LinAlg::HessenbergWorkspace &hws,
+                         Matrix &V, Matrix &Z)
+{
+    const auto n = M.rows();
+    const double bnorm = b.norm();
+    if (bnorm == 0.0)
+        return 1;
+    if (!std::isfinite(bnorm))
+        return 0;
+    // right preconditioning: M P^-1 v = b, x = P^-1 v, with P the upper-Hessenberg part of M (LinAlg::hessenberg
+    // reads only the entries i <= j + 1); Givens rotations on the small Hessenberg matrix H
+    const unsigned m = std::max(1u, maxIter);
+    V.resize(n, m + 1);
+    Z.resize(n, m);
+    Matrix H = Matrix::Zero(m + 1, m);
+    Vector cs(m), sn(m), g = Vector::Zero(m + 1);
+    g[0] = bnorm;
+    V.col(0) = b / bnorm;
+    unsigned j = 0;
+    while (j < m)
+    {
+        Vector z = V.col(j);
+        LinAlg::hessenberg(M.data(), z.data(), static_cast<uint32_t>(n), hws);
+        Z.col(j) = z;
+        Vector w = M * z;
+        for (unsigned i = 0; i <= j; ++i)  // modified Gram-Schmidt
+        {
+            H(i, j) = V.col(i).dot(w);
+            w -= H(i, j) * V.col(i);
+        }
+        H(j + 1, j) = w.norm();
+        if (H(j + 1, j) > 0.0)
+            V.col(j + 1) = w / H(j + 1, j);
+        for (unsigned i = 0; i < j; ++i)
+        {
+            const double t = cs[i] * H(i, j) + sn[i] * H(i + 1, j);
+            H(i + 1, j) = -sn[i] * H(i, j) + cs[i] * H(i + 1, j);
+            H(i, j) = t;
+        }
+        const double r = std::hypot(H(j, j), H(j + 1, j));
+        cs[j] = H(j, j) / r;
+        sn[j] = H(j + 1, j) / r;
+        H(j, j) = r;
+        H(j + 1, j) = 0.0;
+        g[j + 1] = -sn[j] * g[j];
+        g[j] *= cs[j];
+        ++j;
+        if (!std::isfinite(g[j]))
+            return 0;
+        if (std::abs(g[j]) <= tol * bnorm)
+        {
+            const Vector y = H.topLeftCorner(j, j).triangularView<Eigen::Upper>().solve(g.head(j));
+            b = Z.leftCols(j) * y;
+            return j;
+        }
+    }
+    return 0;
+}
+
+void TimeDependentBoltzmann::solveKrylov(Vector &b)
+{
+    if (m_luCurrent)
+    {
+        b = m_lu.solve(b);
+        return;
+    }
+    const unsigned it = gmresHessenberg(m_work, b, m_opt.krylovTol, m_opt.krylovMaxIter, m_hws, m_krylovV, m_krylovZ);
+    m_diag.krylovIterations += it ? it : m_opt.krylovMaxIter;
+    if (it)
+        return;
+    if (m_diag.krylovFallbacks++ == 0)
+        Log<Message>::Notify("timeDependent: GMRES did not reach ", m_opt.krylovTol, " in ", m_opt.krylovMaxIter,
+                             " iterations; dense LU for this system (counted in krylovFallbacks).");
+    m_lu.compute(m_work);
+    m_luCurrent = true;
+    b = m_lu.solve(b);
 }
 
 void TimeDependentBoltzmann::stage(double a, double EoN2, const Vector &rhs, NonLinearState &nl, Vector &x,
@@ -936,6 +1032,7 @@ void TimeDependentBoltzmann::solveSystemDynamic(double a, double e, const Vector
         }
     }
     x0 = rhs0 + (a * m_N) * divergence(phiHist);
+    m_luCurrent = false;
     if (m_solver == Solver::lu)
         m_lu.compute(m_work);
     resolve(x0);
@@ -1511,7 +1608,8 @@ void TimeDependentBoltzmann::writeCycleAverage(unsigned periods, double t0, doub
        << "\nPfield(eVm3/s) " << pfield << "\nPeDensGrowth(eVm3/s) " << pgrowth << "\nPelastic(eVm3/s) " << pw.elasticNet
        << "\nPinelastic(eVm3/s) " << pw.inelastic << "\nPsuperelastic(eVm3/s) " << pw.superelastic
        << "\nPbalance(eVm3/s) " << pw.balance << "\nrelativeBalance " << pw.relativeBalance << "\nsteps "
-       << m_diag.steps << "\nrejected " << m_diag.rejected << "\nsolves " << m_diag.solves << "\nmaxNormDrift "
+       << m_diag.steps << "\nrejected " << m_diag.rejected << "\nsolves " << m_diag.solves << "\nkrylovIterations " << m_diag.krylovIterations
+       << "\nkrylovFallbacks " << m_diag.krylovFallbacks << "\nmaxNormDrift "
        << m_diag.maxNormDrift << "\ncells " << m_n << "\nuMax " << grid.uMax() << "\nwallTime " << wall << " s\n";
     Log<Message>::Notify("timeDependent cycle average:\n", os.str());
     if (!m_outFolder.empty())
@@ -1577,7 +1675,8 @@ void TimeDependentBoltzmann::run()
 
     std::ostringstream summary;
     summary << "finalTime " << m_t << " s\nsteps " << m_diag.steps << "\nrejected " << m_diag.rejected
-            << "\nsolves " << m_diag.solves << "\nmaxNormDrift " << m_diag.maxNormDrift << "\nminEedf "
+            << "\nsolves " << m_diag.solves << "\nkrylovIterations " << m_diag.krylovIterations
+       << "\nkrylovFallbacks " << m_diag.krylovFallbacks << "\nmaxNormDrift " << m_diag.maxNormDrift << "\nminEedf "
             << m_diag.minEedf << "\ncells " << m_n << "\nuMax " << m_ek.grid().uMax() << "\nwallTime " << elapsed
             << " s\n";
     Log<Message>::Notify("timeDependent finished:\n", summary.str());

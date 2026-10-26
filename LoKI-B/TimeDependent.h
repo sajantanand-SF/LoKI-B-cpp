@@ -132,7 +132,24 @@ struct TimeDependentOptions
     double nonLinearTol = 1e-10;
     double eeTol = 1e-9;
     unsigned long maxSteps = 100000000;
+    /** Linear solver for stage matrices with entries below the first sub-diagonal (superelastic collisions: gains
+     *  from below, e.g. with metastable populations). automatic: GMRES preconditioned with the upper-Hessenberg part
+     *  (solved with LinAlg::hessenberg, ~N^2), to a relative residual krylovTol, with dense LU as the fallback when
+     *  it has not converged after krylovMaxIter iterations; lu: dense LU (~N^3). Matrices that are tridiagonal or
+     *  upper Hessenberg always use TDMA or LinAlg::hessenberg.
+     */
+    enum class LinearSolver { automatic, lu };
+    LinearSolver linearSolver = LinearSolver::automatic;
+    double krylovTol = 1e-14;
+    unsigned krylovMaxIter = 30;
 };
+
+/** Solve M x = b (x overwrites b) by GMRES from x0 = 0, right-preconditioned with the upper-Hessenberg part of M
+ *  (entries i <= j + 1, solved with LinAlg::hessenberg), to |b - M x| <= tol |b|. V and Z are workspaces (resized
+ *  here). Returns the number of iterations, or 0 if not converged after maxIter (b is then unchanged).
+ */
+unsigned gmresHessenberg(const Matrix &M, Vector &b, double tol, unsigned maxIter, LinAlg::HessenbergWorkspace &hws,
+                         Matrix &V, Matrix &Z);
 
 class TimeDependentBoltzmann
 {
@@ -176,6 +193,7 @@ private:
     struct Diagnostics
     {
         unsigned long steps = 0, rejected = 0, solves = 0;
+        unsigned long krylovIterations = 0, krylovFallbacks = 0;
         double maxNormDrift = 0.0;
         double lastStep = 0.0;
         double minEedf = 0.0;
@@ -202,6 +220,8 @@ private:
     void solveSystem(double a, double EoN2, const NonLinearState &nl, Vector &x);
     /// re-solve with the matrix currently in m_work
     void resolve(Vector &x);
+    /// solve m_work x = b (x overwrites b) by GMRES, preconditioned with the upper-Hessenberg part of m_work
+    void solveKrylov(Vector &b);
     /// implicit stage: (W - a N A(nl)) x = rhs, with nl = nl(x) iterated if iterate
     void stage(double a, double EoN2, const Vector &rhs, NonLinearState &nl, Vector &x, bool iterate);
     void prepareOutputState();
@@ -262,8 +282,10 @@ private:
     double m_Fc = -1.0;  // CIEff used for m_F
     Vector m_coefsCI;
     bool m_nonConservative = false;
-    enum class Solver { tdma, hessenberg, lu } m_solver = Solver::lu;
+    enum class Solver { tdma, hessenberg, lu, krylov } m_solver = Solver::lu;
     Matrix m_work;
+    Matrix m_krylovV, m_krylovZ;  // GMRES basis and preconditioned basis (N x krylovMaxIter+1)
+    bool m_luCurrent = false;     // krylov: m_lu holds the factorization of m_work (after a fallback)
     LinAlg::HessenbergWorkspace m_hws;
     Eigen::PartialPivLU<Matrix> m_lu;
 
