@@ -1189,6 +1189,19 @@ bool TimeDependentBoltzmann::stepDynamic(double h, double &errNorm)
 
 void TimeDependentBoltzmann::initialize()
 {
+    initializeImpl(nullptr, nullptr);
+}
+
+void TimeDependentBoltzmann::initialize(const Vector &u, const Vector &f0)
+{
+    if (u.size() != f0.size() || u.size() < 2)
+        throw std::runtime_error("timeDependent: initialize(u, f0) needs energies and EEDF values of equal length >= 2.");
+    initializeImpl(&u, &f0);
+}
+
+void TimeDependentBoltzmann::initializeImpl(const Vector *u0, const Vector *f00)
+{
+    const bool warm = u0 != nullptr;
     const Grid &grid = m_ek.grid();
     if (m_opt.gridFromPeakField && grid.smartGrid())
     {
@@ -1200,7 +1213,30 @@ void TimeDependentBoltzmann::initialize()
     }
     assembleFixedOperators();
 
-    if (m_opt.initial == TimeDependentOptions::Initial::steadyState)
+    if (warm)
+    {
+        // log-linear interpolation of the given f0 onto the cell energies; 0 above its last energy
+        const Vector &u = *u0, &f = *f00;
+        const Vector &cells = grid.getCells();
+        m_f.resize(m_n);
+        Grid::Index j = 0;
+        for (Grid::Index k = 0; k < m_n; ++k)
+        {
+            const double e = cells[k];
+            if (e > u[u.size() - 1])
+            {
+                m_f[k] = 0.0;
+                continue;
+            }
+            while (j + 2 < u.size() && u[j + 1] < e)
+                ++j;
+            const double w = std::clamp((e - u[j]) / (u[j + 1] - u[j]), 0.0, 1.0);
+            const double a = std::log(std::max(f[j], 1e-300)), b = std::log(std::max(f[j + 1], 1e-300));
+            m_f[k] = std::exp(a + w * (b - a));
+        }
+        Log<Message>::Notify("timeDependent: initial state is the given EEDF (warm start).");
+    }
+    else if (m_opt.initial == TimeDependentOptions::Initial::steadyState)
     {
         double e0 = (*m_waveform)(0.0);
         if (m_opt.initialReducedField == "rms")
@@ -1223,10 +1259,11 @@ void TimeDependentBoltzmann::initialize()
     m_c = ciEff(m_f);
     m_ne = m_wc.electronDensity();
     double sa = 0, sw = 0, sphi = 0, soff = 0;
-    const bool harmonicStart = m_dynF1 && m_opt.initial == TimeDependentOptions::Initial::steadyState &&
-                               m_opt.initialReducedField == "rms" && m_waveform->sinusoid(sa, sw, sphi, soff) &&
-                               soff == 0.0;
-    if (harmonicStart)
+    const bool sinusoid = m_waveform->sinusoid(sa, sw, sphi, soff) && soff == 0.0;
+    const bool harmonicStart = m_dynF1 && sinusoid &&
+                               (warm || (m_opt.initial == TimeDependentOptions::Initial::steadyState &&
+                                         m_opt.initialReducedField == "rms"));
+    if (harmonicStart && !warm)
     {
         // LoKI-B's HF steady state at E_rms and omega, and the harmonic f1: the periodic state when omega >> nu_u
         Log<Message>::Notify("timeDependent: initial state is the HF steady solution at E_rms = ",
@@ -1244,6 +1281,10 @@ void TimeDependentBoltzmann::initialize()
     m_t = 0.0;
     m_tPrev = -1.0;
     m_nextSample = 0;
+    // periodic-mode state (a repeated initialize() starts a new periodic run)
+    m_frozen = false;
+    m_schedule.clear();
+    m_hPeriodStart = 0.0;
     m_diag = Diagnostics();
     m_diag.minEedf = m_f.minCoeff();
 
@@ -1502,6 +1543,8 @@ void TimeDependentBoltzmann::runPeriodic()
         pOld = pbar;
         deltaOld = delta;
     }
+    m_periodicResult = PeriodicResult();
+    m_periodicResult.converged = converged;
     if (!converged)
         Log<Message>::Warning("timeDependent: no periodic steady state after ", p, " periods (periodic.tol = ",
                               m_opt.periodicTol, ").");
@@ -1612,6 +1655,18 @@ void TimeDependentBoltzmann::writeCycleAverage(unsigned periods, double t0, doub
        << "\nkrylovFallbacks " << m_diag.krylovFallbacks << "\nmaxNormDrift "
        << m_diag.maxNormDrift << "\ncells " << m_n << "\nuMax " << grid.uMax() << "\nwallTime " << wall << " s\n";
     Log<Message>::Notify("timeDependent cycle average:\n", os.str());
+    PeriodicResult &res = m_periodicResult;
+    res.periods = periods;
+    res.reducedFieldRMS = erms;
+    res.energy = grid.getCells();
+    res.eedf = fbar;
+    res.meanEnergy = meanEnergy(fbar);
+    res.CIEff = cbar;
+    res.power = pw;
+    res.swarm = m_ek.swarmParameters;
+    res.rates = m_ek.mixture.collision_data().rateCoefficients();
+    res.eedfEnd = m_f;
+    res.wallTime = wall;
     if (!m_outFolder.empty())
         std::ofstream(m_outFolder / "cycleAverage.txt") << os.str();
 }

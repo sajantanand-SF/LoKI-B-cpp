@@ -167,6 +167,31 @@ public:
 
     // stepper interface (also used by run())
     void initialize();
+    /** Warm start: as initialize(), but the initial f0 is the given EEDF (energies u in eV, values f0; interpolated
+     *  log-linearly onto the current grid, zero above u.back(), normalized) instead of the steady or Maxwellian state.
+     *  f1 (dynamic anisotropy) is the harmonic f1 of this f0 for a sinusoid, the quasi-static f1 otherwise.
+     */
+    void initialize(const Vector &u, const Vector &f0);
+    /** March to the periodic steady state and average over averagePeriods periods (periodic waveforms; run() calls
+     *  it after initialize()). The results are in periodicResult().
+     */
+    void runPeriodic();
+
+    /// results of the last runPeriodic(): the cycle averages and the state at its end (for a warm start)
+    struct PeriodicResult
+    {
+        unsigned periods = 0;
+        bool converged = false;
+        double reducedFieldRMS = 0.0;  // Td
+        Vector energy, eedf;           // cell energies (eV), cycle-averaged f0
+        double meanEnergy = 0.0, CIEff = 0.0;
+        Power power;                   // of the cycle-averaged f0; field and growth powers are time averages
+        SwarmParameters swarm;         // LoKI's DC formulas on the cycle-averaged f0
+        std::vector<RateCoefficient> rates;
+        Vector eedfEnd;                // f0 at the end (the start of the next period)
+        double wallTime = 0.0;
+    };
+    const PeriodicResult &periodicResult() const { return m_periodicResult; }
     /// advance the state to tEnd under the configured waveform
     void advance(double tEnd);
 
@@ -254,7 +279,7 @@ private:
     void sample();
     void openOutput();
     void emitState(const std::string &jobFolder);
-    void runPeriodic();
+    void initializeImpl(const Vector *u, const Vector *f0);
     void advancePeriod(double t0, double T);
     void writeEedfSamples();
     double horizon() const;
@@ -314,6 +339,7 @@ private:
     double m_hPeriodStart = 0.0;  // first step of every period (periodic mode)
     bool m_recordFirstStep = false;
     Diagnostics m_diag;
+    PeriodicResult m_periodicResult;
 
     std::filesystem::path m_outFolder;
     std::ofstream m_timeSeries, m_rates;

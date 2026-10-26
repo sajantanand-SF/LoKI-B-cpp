@@ -335,6 +335,10 @@ else()
     add_subdirectory(ideas)
 endif(EMSCRIPTEN)
 add_subdirectory(LoKI-B)
+option(LOKIB_PYTHON "-DLOKIB_PYTHON=ON|OFF : Build the Python bindings (module lokib, needs pybind11)" OFF)
+if (LOKIB_PYTHON)
+  add_subdirectory(python)
+endif()
 add_subdirectory(input)
 
 # Option -Dwith-doc: configure whether documentation can be built.
