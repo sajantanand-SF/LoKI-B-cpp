@@ -30,6 +30,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -116,6 +117,16 @@ struct TimeDependentOptions
      *  (a numerical period-2 cycle whose amplitude sets a floor on delta_p).
      */
     double freezeTol = 1e-3;
+    /** Acceleration of the march to the periodic state (design note §14). none: plain marching. anderson: Anderson
+     *  mixing on the one-period map x -> P_T(x), x = (f0, f1) at the period start, over the last andersonDepth
+     *  periods, once the step schedule is frozen (the map is then fixed). Each period still integrates the map once;
+     *  the next period starts from the mixed state instead of P_T(x). Mixing stops for good when the map residual
+     *  max_i |P_T(x)_i - x_i| / (|P_T(x)_i| + periodicAtol max P_T(x)) (f1: relative to its own scale) is below
+     *  periodicTol; the convergence test then needs the usual plain (unmixed) periods.
+     */
+    enum class Accelerator { none, anderson };
+    Accelerator accelerator = Accelerator::none;
+    unsigned andersonDepth = 8;
 
     double rtol = 1e-4;
     double atol = 1e-12;
@@ -151,6 +162,29 @@ struct TimeDependentOptions
 unsigned gmresHessenberg(const Matrix &M, Vector &b, double tol, unsigned maxIter, LinAlg::HessenbergWorkspace &hws,
                          Matrix &V, Matrix &Z);
 
+/** Anderson mixing (type II) for a fixed-point iteration x = g(x) (periodic accelerator anderson, design note §14).
+ *  Residuals are weighted, r = w (g(x) - x); the next start is g - dG gamma, with gamma the least-squares fit of r
+ *  by the last depth residual differences dR (dG: the map-value differences). If the residual grows above 10 times
+ *  the smallest one seen, the history is dropped and the next start is the plain map value.
+ */
+class AndersonMixer
+{
+public:
+    explicit AndersonMixer(unsigned depth) : m_depth(depth) {}
+    void setWeights(const Vector &w) { m_w = w; }
+    bool hasWeights() const { return m_w.size() > 0; }
+    /// x: the start, g = g(x): returns max |r|, and the next start in next
+    double update(const Vector &x, const Vector &g, Vector &next);
+    unsigned long restarts() const { return m_restarts; }
+
+private:
+    unsigned m_depth;
+    Vector m_w, m_rOld, m_gOld;
+    std::vector<Vector> m_dR, m_dG;
+    double m_residualMin = std::numeric_limits<double>::infinity();
+    unsigned long m_restarts = 0;
+};
+
 class TimeDependentBoltzmann
 {
 public:
@@ -181,6 +215,7 @@ public:
     struct PeriodicResult
     {
         unsigned periods = 0;
+        unsigned long andersonSteps = 0;  // mixed periods (accelerator anderson)
         bool converged = false;
         double reducedFieldRMS = 0.0;  // Td
         Vector energy, eedf;           // cell energies (eV), cycle-averaged f0
@@ -219,6 +254,7 @@ private:
     {
         unsigned long steps = 0, rejected = 0, solves = 0;
         unsigned long krylovIterations = 0, krylovFallbacks = 0;
+        unsigned long andersonSteps = 0, andersonRestarts = 0;
         double maxNormDrift = 0.0;
         double lastStep = 0.0;
         double minEedf = 0.0;
@@ -281,6 +317,9 @@ private:
     void emitState(const std::string &jobFolder);
     void initializeImpl(const Vector *u, const Vector *f0);
     void advancePeriod(double t0, double T);
+    /// the period-start state x = (f0, f1) (f1 only with dynamic anisotropy), and its inverse (renormalizes f0)
+    Vector periodState() const;
+    void setPeriodState(const Vector &x);
     void writeEedfSamples();
     double horizon() const;
     /// gamma*(E/N)^2 * sum_k u_k du_k (F f)_k: power from the field per electron at unit density (eVm3/s)
