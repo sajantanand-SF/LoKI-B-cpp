@@ -324,6 +324,7 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
         else
             throw std::runtime_error("timeDependent.periodic: accelerator must be 'none' or 'anderson', not '" + acc + "'.");
         andersonDepth = static_cast<unsigned>(getDouble(pc, "andersonDepth", andersonDepth));
+        andersonTol = getDouble(pc, "andersonTol", andersonTol);
         if (andersonDepth < 1)
             throw std::runtime_error("timeDependent.periodic: andersonDepth >= 1.");
         if (averagePeriods < 1 || samplesPerPeriod < 1 || stepsPerPeriod < 1 || minPeriods < 2)
@@ -1635,7 +1636,7 @@ void TimeDependentBoltzmann::runPeriodic()
             residual = mixer.update(xStart, g, x);
             m_diag.andersonRestarts = mixer.restarts();
             compared = 0;  // this period started from a mixed state: not a period-to-period comparison
-            if (residual < m_opt.periodicTol)
+            if (residual < (m_opt.andersonTol > 0 ? m_opt.andersonTol : 0.01 * m_opt.periodicTol))
             {
                 mixing = false;  // plain periods from here on decide convergence
                 Log<Message>::Notify("timeDependent: Anderson mixing off after period ", p + 1, " (map residual ",

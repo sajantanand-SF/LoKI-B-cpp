@@ -122,11 +122,15 @@ struct TimeDependentOptions
      *  periods, once the step schedule is frozen (the map is then fixed). Each period still integrates the map once;
      *  the next period starts from the mixed state instead of P_T(x). Mixing stops for good when the map residual
      *  max_i |P_T(x)_i - x_i| / (|P_T(x)_i| + periodicAtol max P_T(x)) (f1: relative to its own scale) is below
-     *  periodicTol; the convergence test then needs the usual plain (unmixed) periods.
+     *  andersonTol (default periodicTol/100); the convergence test then needs the usual plain (unmixed) periods.
+     *  andersonTol is well below periodicTol because the plain test also bounds the remaining change,
+     *  delta r/(1 - r) with r the slowest contraction (~0.98 at low pressure): mixing to periodicTol only would
+     *  leave ~50x of it to plain marching (V12d).
      */
     enum class Accelerator { none, anderson };
     Accelerator accelerator = Accelerator::none;
     unsigned andersonDepth = 8;
+    double andersonTol = 0.0;  // 0: periodicTol/100
 
     double rtol = 1e-4;
     double atol = 1e-12;
