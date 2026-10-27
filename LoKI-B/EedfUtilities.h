@@ -84,7 +84,17 @@ lokib_export Vector makePrescribedEDF(const Grid& grid, double s, double T_eV, b
  *  achieve the normalization. For C we use matrix element (1,1), to
  *  avoid widening the dynamic range of the matrix elements.
  */
-lokib_export void solveEEDF(Vector &eedf, Matrix &matrix, const Grid &grid);
+/** Linear solver for EEDF matrices with entries below the first sub-diagonal (superelastic collisions);
+ *  tridiagonal and upper-Hessenberg matrices always use TDMA and LinAlg::hessenberg.
+ *  dense:  LU with partial pivoting (~N^3; the default).
+ *  sparse: GMRES right-preconditioned with the tridiagonal part (TridiagonalPlusSparse, ~nnz per iteration), to a
+ *          relative residual of 1e-14; dense LU if it has not converged after 60 iterations (logged).
+ *  Set by electronKinetics.numerics.linearSolver.
+ */
+enum class EedfLinearSolver { dense, sparse };
+
+lokib_export void solveEEDF(Vector &eedf, Matrix &matrix, const Grid &grid,
+                            EedfLinearSolver solver = EedfLinearSolver::dense);
 
 
 } // namespace loki

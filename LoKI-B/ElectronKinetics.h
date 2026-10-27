@@ -35,6 +35,7 @@
 #include "LoKI-B/EedfMixture.h"
 #include "LoKI-B/Event.h"
 #include "LoKI-B/Grid.h"
+#include "LoKI-B/EedfUtilities.h"
 #include "LoKI-B/LinearAlgebra.h"
 #include "LoKI-B/MacroscopicQuantities.h"
 #include "LoKI-B/Power.h"
@@ -274,6 +275,11 @@ private:
     double eeAndersonRestartFactor = 2.;   // clear the history when |r| grows by more than this factor
     bool eeAndersonWeighted = false;       // least squares and restart test with electron weights f*sqrt(u)*du
     double eeInnerTolFactor = 1.;          // damped/anderson: converge the e-e loop to this factor x maxEedfRelError
+
+    /** Linear solver for EEDF matrices with superelastic terms (solveEEDF), set by the optional key
+     *  numerics.linearSolver: dense (default) or sparse.
+     */
+    EedfLinearSolver eedfLinearSolver = EedfLinearSolver::dense;
 
 };
 

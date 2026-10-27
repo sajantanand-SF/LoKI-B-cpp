@@ -231,6 +231,48 @@ void solveTDMA(const Matrix& A, const Vector& b, Vector& x);
 void solveTDMA(const Matrix& A, Vector& bx);
 
 } // namespace LinAlg
+
+/* Krylov solves for the stage matrices of the time-dependent mode and for steady EEDF matrices
+ * (numerics.linearSolver sparse).
+ */
+
+/** Solve M x = b (x overwrites b) by GMRES from x0 = 0, right-preconditioned with the upper-Hessenberg part of M
+ *  (entries i <= j + 1, solved with LinAlg::hessenberg), to |b - M x| <= tol |b|. V and Z are workspaces (resized
+ *  here). Returns the number of iterations, or 0 if not converged after maxIter (b is then unchanged).
+ */
+unsigned gmresHessenberg(const Matrix &M, Vector &b, double tol, unsigned maxIter, LinAlg::HessenbergWorkspace &hws,
+                         Matrix &V, Matrix &Z);
+
+/** A stage matrix M = T + s*R (linearSolver sparse): T tridiagonal (lo(i) = M(i,i-1), d(i) = M(i,i),
+ *  up(i) = M(i,i+1)), R sparse with no entries on the three central diagonals.
+ */
+struct TridiagonalPlusSparse
+{
+    using RowMajorSparse = Eigen::SparseMatrix<double, Eigen::RowMajor>;
+    RowMajorSparse R;
+    double s = 1.0;
+    Vector lo, d, up;
+    /// sets T to s times the given diagonals (the tridiagonal part of the unscaled matrix)
+    void setTridiagonal(double scale, const Vector &lo0, const Vector &d0, const Vector &up0);
+    /// M(i,j) += v for |i - j| <= 1
+    void add(Eigen::Index i, Eigen::Index j, double v);
+    Vector apply(const Vector &x) const;
+    /// Thomas factorization of T, for solveTridiagonal
+    void factor();
+    /// x <- T^-1 x (after factor())
+    void solveTridiagonal(Vector &x) const;
+    /// the dense matrix M
+    void toDense(Matrix &M) const;
+
+private:
+    Vector m_c, m_inv;  // Thomas: modified super-diagonal and inverse pivots
+};
+
+/** Solve M x = b (x overwrites b) by GMRES from x0 = 0, right-preconditioned with the tridiagonal part T of M (after
+ *  M.factor()), to |b - M x| <= tol |b|. Returns the number of iterations, or 0 if not converged (b is then unchanged).
+ */
+unsigned gmresTridiagonal(const TridiagonalPlusSparse &M, Vector &b, double tol, unsigned maxIter, Matrix &V, Matrix &Z);
+
 } // namespace loki
 
 #endif // LOKI_CPP_LINEARALGEBRA_H

@@ -123,6 +123,14 @@ ElectronKineticsBoltzmann::ElectronKineticsBoltzmann(const std::filesystem::path
         if (!(eeMixingParameter > 0. && eeMixingParameter <= 1.))
             throw std::runtime_error("eeMixingParameter must be in (0, 1].");
     }
+    if (cnf.at("numerics").contains("linearSolver"))
+    {
+        const std::string ls = cnf.at("numerics").at("linearSolver").get<std::string>();
+        if (ls == "sparse")
+            eedfLinearSolver = EedfLinearSolver::sparse;
+        else if (ls != "dense")
+            throw std::runtime_error("numerics.linearSolver must be 'dense' or 'sparse', not '" + ls + "'.");
+    }
     if (growthModelType == GrowthModelType::spatial && workingConditions->reducedExcFreqSI()!=0.0)
     {
         throw std::runtime_error("The excitation frequency must be zero when "
@@ -300,7 +308,7 @@ void ElectronKineticsBoltzmann::invertLinearMatrix()
 
 void ElectronKineticsBoltzmann::invertMatrix(Matrix &matrix)
 {
-    solveEEDF(eedf,matrix,grid());
+    solveEEDF(eedf,matrix,grid(),eedfLinearSolver);
 }
 
 void ElectronKineticsBoltzmann::solveSpatialGrowthMatrix()

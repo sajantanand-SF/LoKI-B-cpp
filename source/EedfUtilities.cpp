@@ -29,8 +29,10 @@
 
 #include "LoKI-B/EedfUtilities.h"
 #include "LoKI-B/GridOps.h"
+#include "LoKI-B/Log.h"
 #include <cmath>
 #include <chrono>
+#include <vector>
 
 namespace loki {
 
@@ -68,7 +70,44 @@ Vector makePrescribedEDF(const Grid& grid, double s, double T_eV, bool normalize
     return edf;
 }
 
-void solveEEDF(Vector &eedf, Matrix &matrix, const Grid &grid)
+namespace
+{
+
+/// EedfLinearSolver::sparse: b <- matrix^-1 b by GMRES preconditioned with the tridiagonal part; false (b unchanged)
+/// if it has not converged
+bool solveEEDFSparse(const Matrix &matrix, Vector &b)
+{
+    constexpr double tol = 1e-14;
+    constexpr unsigned maxIter = 60;
+    const auto n = matrix.rows();
+    Vector lo = Vector::Zero(n), up = Vector::Zero(n);
+    std::vector<Eigen::Triplet<double>> rest;
+    for (Eigen::Index j = 0; j < n; ++j)
+        for (Eigen::Index i = 0; i < n; ++i)
+        {
+            const double v = matrix(i, j);
+            if (i == j + 1)
+                lo[i] = v;
+            else if (i + 1 == j)
+                up[i] = v;
+            else if (i != j && v != 0.0)
+                rest.emplace_back(i, j, v);
+        }
+    TridiagonalPlusSparse M;
+    M.setTridiagonal(1.0, lo, matrix.diagonal(), up);
+    M.R.resize(n, n);
+    M.R.setFromTriplets(rest.begin(), rest.end());
+    M.factor();
+    Matrix V, Z;
+    if (gmresTridiagonal(M, b, tol, maxIter, V, Z))
+        return true;
+    Log<Message>::Notify("solveEEDF: sparse GMRES did not reach ", tol, " in ", maxIter, " iterations; dense LU.");
+    return false;
+}
+
+} // namespace
+
+void solveEEDF(Vector &eedf, Matrix &matrix, const Grid &grid, EedfLinearSolver solver)
 {
 // show matrix inversion times?
 #define LOKIB_MATRIX_TIME_INVERSION 0
@@ -146,6 +185,10 @@ void solveEEDF(Vector &eedf, Matrix &matrix, const Grid &grid)
          * system of equations.
          */
         LinAlg::hessenberg(matrix.data(), eedf.data(), grid.nCells());
+    }
+    else if (solver == EedfLinearSolver::sparse && solveEEDFSparse(matrix, eedf))
+    {
+        // eedf held b and now holds the solution
     }
     else
     {
