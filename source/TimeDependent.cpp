@@ -386,8 +386,10 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
         const std::string ls = getString(ig, "linearSolver", "auto");
         if (ls == "lu")
             linearSolver = LinearSolver::lu;
+        else if (ls == "sparse")
+            linearSolver = LinearSolver::sparse;
         else if (ls != "auto")
-            throw std::runtime_error("timeDependent: integrator.linearSolver must be 'auto' or 'lu'.");
+            throw std::runtime_error("timeDependent: integrator.linearSolver must be 'auto', 'lu' or 'sparse'.");
         krylovTol = getDouble(ig, "krylovTolerance", krylovTol);
         krylovMaxIter = static_cast<unsigned>(getDouble(ig, "krylovMaxIterations", krylovMaxIter));
     }
@@ -500,14 +502,43 @@ void TimeDependentBoltzmann::assembleFixedOperators()
                    : (lower == -1 ? Solver::hessenberg
                                   : (m_opt.linearSolver == TimeDependentOptions::LinearSolver::lu ? Solver::lu
                                                                                                   : Solver::krylov));
+    if (m_opt.linearSolver == TimeDependentOptions::LinearSolver::sparse && m_solver != Solver::tdma)
+    {
+        m_denseSolver = m_solver == Solver::hessenberg ? Solver::hessenberg : Solver::krylov;
+        m_solver = Solver::sparse;
+        m_A0lo = Vector::Zero(m_n);
+        m_A0d = m_A0.diagonal();
+        m_A0up = Vector::Zero(m_n);
+        std::vector<Eigen::Triplet<double>> rest;
+        for (Grid::Index j = 0; j < m_n; ++j)
+            for (Grid::Index i = 0; i < m_n; ++i)
+            {
+                const double v = m_A0(i, j);
+                if (i == j + 1)
+                    m_A0lo[i] = v;
+                else if (i + 1 == j)
+                    m_A0up[i] = v;
+                else if (i != j && v != 0.0)
+                    rest.emplace_back(i, j, v);
+            }
+        m_stage.R.resize(m_n, m_n);
+        m_stage.R.setFromTriplets(rest.begin(), rest.end());
+        m_stage.R.makeCompressed();
+        Log<Message>::Notify("timeDependent: sparse stage matrices, ", rest.size(), " entries off the tridiagonal (",
+                             100.0 * double(rest.size()) / (double(m_n) * double(m_n)), " % of N^2)");
+    }
     m_work.resize(m_n, m_n);
     m_hws.resize(m_n);
     Log<Message>::Notify("timeDependent: ", m_n, " cells, uMax = ", grid.uMax(), " eV, bandwidth [", lower, ",", upper,
                          "], solver ",
                          m_solver == Solver::tdma
                              ? "TDMA"
-                             : (m_solver == Solver::hessenberg ? "Hessenberg"
-                                                               : (m_solver == Solver::lu ? "LU" : "GMRES (Hessenberg-preconditioned)")),
+                             : (m_solver == Solver::hessenberg
+                                    ? "Hessenberg"
+                                    : (m_solver == Solver::lu ? "LU"
+                                                              : (m_solver == Solver::sparse
+                                                                     ? "GMRES (sparse, tridiagonal-preconditioned)"
+                                                                     : "GMRES (Hessenberg-preconditioned)"))),
                          ", growth ", m_nonConservative ? "non-conservative (temporal)" : "none (conservative)",
                          ", electronDensity ",
                          m_opt.electronDensity == TimeDependentOptions::ElectronDensity::swarm
@@ -559,7 +590,8 @@ TimeDependentBoltzmann::NonLinearState TimeDependentBoltzmann::nonLinearState(co
 Vector TimeDependentBoltzmann::applyNA(const Vector &f, double EoN2, const NonLinearState &nl) const
 {
     // evaluateField is non-const (it caches F); callers make sure F matches nl.c
-    Vector r = m_A0 * f + EoN2 * (m_F * f);
+    Vector r = m_solver == Solver::sparse ? Vector(sparseA0Product(f) + EoN2 * (m_F * f))
+                                          : Vector(m_A0 * f + EoN2 * (m_F * f));
     if (m_nonConservative)
         r -= (nl.c / SI::gamma) * m_sqrtU.cwiseProduct(f);
     if (m_ee)
@@ -578,6 +610,34 @@ void TimeDependentBoltzmann::solveSystem(double a, double EoN2, const NonLinearS
 {
     evaluateField(nl.c);
     const double s = -a * m_N;
+    m_luCurrent = false;
+    if (m_solver == Solver::sparse)
+    {
+        // the same terms as below, into the tridiagonal part of m_stage (kept separate from the dense assembly so
+        // that its floating-point operations, FMA contractions included, stay as they were)
+        m_stage.setTridiagonal(s, m_A0lo, m_A0d, m_A0up);
+        for (int k = 0; k < m_F.outerSize(); ++k)
+            for (SparseMatrix::InnerIterator it(m_F, k); it; ++it)
+                m_stage.add(it.row(), it.col(), s * EoN2 * it.value());
+        for (Grid::Index k = 0; k < m_n; ++k)
+        {
+            m_stage.d[k] += m_W[k];
+            if (m_nonConservative)
+                m_stage.d[k] += a * m_N * (nl.c / SI::gamma) * m_sqrtU[k];
+            if (m_ee)
+            {
+                m_stage.d[k] -= s * (nl.A[k] + nl.B[k]);
+                if (k > 0)
+                    m_stage.lo[k] += s * nl.A[k - 1];
+                if (k < m_n - 1)
+                    m_stage.up[k] += s * nl.B[k + 1];
+            }
+        }
+        m_stage.factor();
+        m_denseCurrent = false;
+        resolve(x);
+        return;
+    }
     m_work.noalias() = s * m_A0;
     for (int k = 0; k < m_F.outerSize(); ++k)
         for (SparseMatrix::InnerIterator it(m_F, k); it; ++it)
@@ -597,7 +657,6 @@ void TimeDependentBoltzmann::solveSystem(double a, double EoN2, const NonLinearS
                 m_work(k, k + 1) += s * nl.B[k + 1];
         }
     }
-    m_luCurrent = false;
     if (m_solver == Solver::lu)
         m_lu.compute(m_work);
     resolve(x);
@@ -620,20 +679,27 @@ void TimeDependentBoltzmann::resolve(Vector &x)
     case Solver::krylov:
         solveKrylov(x);
         break;
+    case Solver::sparse:
+        solveSparse(x);
+        break;
     }
 }
 
-unsigned gmresHessenberg(const Matrix &M, Vector &b, double tol, unsigned maxIter, LinAlg::HessenbergWorkspace &hws,
-                         Matrix &V, Matrix &Z)
+namespace
 {
-    const auto n = M.rows();
+
+/// GMRES from x0 = 0 for M x = b (x overwrites b), right-preconditioned: apply(z) returns M z, precondition(z) sets
+/// z <- P^-1 z. Returns the number of iterations, or 0 if not converged after maxIter (b is then unchanged).
+template <class Apply, class Precondition>
+unsigned gmres(Eigen::Index n, const Apply &apply, const Precondition &precondition, Vector &b, double tol,
+               unsigned maxIter, Matrix &V, Matrix &Z)
+{
     const double bnorm = b.norm();
     if (bnorm == 0.0)
         return 1;
     if (!std::isfinite(bnorm))
         return 0;
-    // right preconditioning: M P^-1 v = b, x = P^-1 v, with P the upper-Hessenberg part of M (LinAlg::hessenberg
-    // reads only the entries i <= j + 1); Givens rotations on the small Hessenberg matrix H
+    // right preconditioning: M P^-1 v = b, x = P^-1 v; Givens rotations on the small Hessenberg matrix H
     const unsigned m = std::max(1u, maxIter);
     V.resize(n, m + 1);
     Z.resize(n, m);
@@ -645,9 +711,9 @@ unsigned gmresHessenberg(const Matrix &M, Vector &b, double tol, unsigned maxIte
     while (j < m)
     {
         Vector z = V.col(j);
-        LinAlg::hessenberg(M.data(), z.data(), static_cast<uint32_t>(n), hws);
+        precondition(z);
         Z.col(j) = z;
-        Vector w = M * z;
+        Vector w = apply(z);
         for (unsigned i = 0; i <= j; ++i)  // modified Gram-Schmidt
         {
             H(i, j) = V.col(i).dot(w);
@@ -682,6 +748,100 @@ unsigned gmresHessenberg(const Matrix &M, Vector &b, double tol, unsigned maxIte
     return 0;
 }
 
+} // namespace
+
+unsigned gmresHessenberg(const Matrix &M, Vector &b, double tol, unsigned maxIter, LinAlg::HessenbergWorkspace &hws,
+                         Matrix &V, Matrix &Z)
+{
+    // P is the upper-Hessenberg part of M (LinAlg::hessenberg reads only the entries i <= j + 1)
+    const auto n = M.rows();
+    return gmres(
+        n, [&M](const Vector &z) -> Vector { return M * z; },
+        [&](Vector &z) { LinAlg::hessenberg(M.data(), z.data(), static_cast<uint32_t>(n), hws); }, b, tol, maxIter, V,
+        Z);
+}
+
+void TridiagonalPlusSparse::setTridiagonal(double scale, const Vector &lo0, const Vector &d0, const Vector &up0)
+{
+    s = scale;
+    lo = scale * lo0;
+    d = scale * d0;
+    up = scale * up0;
+}
+
+void TridiagonalPlusSparse::add(Eigen::Index i, Eigen::Index j, double v)
+{
+    if (j == i)
+        d[i] += v;
+    else if (j + 1 == i)
+        lo[i] += v;
+    else if (j == i + 1)
+        up[i] += v;
+    else
+        throw std::logic_error("TridiagonalPlusSparse::add: entry off the tridiagonal.");
+}
+
+Vector TridiagonalPlusSparse::apply(const Vector &x) const
+{
+    Vector y = R * x;
+    y *= s;
+    const auto n = x.size();
+    for (Eigen::Index i = 0; i < n; ++i)
+    {
+        y[i] += d[i] * x[i];
+        if (i > 0)
+            y[i] += lo[i] * x[i - 1];
+        if (i < n - 1)
+            y[i] += up[i] * x[i + 1];
+    }
+    return y;
+}
+
+void TridiagonalPlusSparse::factor()
+{
+    const auto n = d.size();
+    m_c.resize(n);
+    m_inv.resize(n);
+    m_inv[0] = 1.0 / d[0];
+    m_c[0] = up[0] * m_inv[0];
+    for (Eigen::Index i = 1; i < n; ++i)
+    {
+        m_inv[i] = 1.0 / (d[i] - lo[i] * m_c[i - 1]);
+        m_c[i] = i < n - 1 ? up[i] * m_inv[i] : 0.0;
+    }
+}
+
+void TridiagonalPlusSparse::solveTridiagonal(Vector &x) const
+{
+    const auto n = x.size();
+    x[0] *= m_inv[0];
+    for (Eigen::Index i = 1; i < n; ++i)
+        x[i] = (x[i] - lo[i] * x[i - 1]) * m_inv[i];
+    for (Eigen::Index i = n - 2; i >= 0; --i)
+        x[i] -= m_c[i] * x[i + 1];
+}
+
+void TridiagonalPlusSparse::toDense(Matrix &M) const
+{
+    M = s * Matrix(R);
+    const auto n = d.size();
+    for (Eigen::Index i = 0; i < n; ++i)
+    {
+        M(i, i) = d[i];
+        if (i > 0)
+            M(i, i - 1) = lo[i];
+        if (i < n - 1)
+            M(i, i + 1) = up[i];
+    }
+}
+
+unsigned gmresTridiagonal(const TridiagonalPlusSparse &M, Vector &b, double tol, unsigned maxIter, Matrix &V, Matrix &Z)
+{
+    return gmres(
+        b.size(), [&M](const Vector &z) { return M.apply(z); }, [&M](Vector &z) { M.solveTridiagonal(z); }, b, tol,
+        maxIter, V, Z);
+}
+
 void TimeDependentBoltzmann::solveKrylov(Vector &b)
 {
     if (m_luCurrent)
@@ -699,6 +859,46 @@ void TimeDependentBoltzmann::solveKrylov(Vector &b)
     m_lu.compute(m_work);
     m_luCurrent = true;
     b = m_lu.solve(b);
+}
+
+Vector TimeDependentBoltzmann::sparseA0Product(const Vector &f) const
+{
+    Vector r = m_stage.R * f;
+    for (Grid::Index k = 0; k < m_n; ++k)
+    {
+        r[k] += m_A0d[k] * f[k];
+        if (k > 0)
+            r[k] += m_A0lo[k] * f[k - 1];
+        if (k < m_n - 1)
+            r[k] += m_A0up[k] * f[k + 1];
+    }
+    return r;
+}
+
+std::string TimeDependentBoltzmann::sparseFallbacksLine() const
+{
+    return m_solver == Solver::sparse ? "\nsparseFallbacks " + std::to_string(m_diag.sparseFallbacks) : std::string();
+}
+
+void TimeDependentBoltzmann::solveSparse(Vector &b)
+{
+    if (!m_denseCurrent)
+    {
+        const unsigned it = gmresTridiagonal(m_stage, b, m_opt.krylovTol, m_opt.krylovMaxIter, m_krylovV, m_krylovZ);
+        m_diag.krylovIterations += it ? it : m_opt.krylovMaxIter;
+        if (it)
+            return;
+        if (m_diag.sparseFallbacks++ == 0)
+            Log<Message>::Notify("timeDependent: sparse GMRES did not reach ", m_opt.krylovTol, " in ",
+                                 m_opt.krylovMaxIter, " iterations; dense solve for this system (counted in sparseFallbacks).");
+        m_stage.toDense(m_work);
+        m_denseCurrent = true;
+        m_luCurrent = false;
+    }
+    if (m_denseSolver == Solver::hessenberg)
+        LinAlg::hessenberg(m_work.data(), b.data(), m_n, m_hws);
+    else
+        solveKrylov(b);
 }
 
 void TimeDependentBoltzmann::stage(double a, double EoN2, const Vector &rhs, NonLinearState &nl, Vector &x,
@@ -960,7 +1160,8 @@ Vector TimeDependentBoltzmann::applyNADynamic(const Vector &f, const Vector &f1,
     Vector phi = Vector::Zero(m_n + 1);
     for (Grid::Index j = 1; j < m_n; ++j)
         phi[j] = -e * (m_uNode[j] / 3.0) * f1[j];
-    Vector r = m_A0 * f + divergence(phi);
+    Vector r = m_solver == Solver::sparse ? Vector(sparseA0Product(f) + divergence(phi))
+                                          : Vector(m_A0 * f + divergence(phi));
     if (m_nonConservative)
         r -= (nl.c / SI::gamma) * m_sqrtU.cwiseProduct(f);
     if (m_ee)
@@ -1003,32 +1204,69 @@ void TimeDependentBoltzmann::solveSystemDynamic(double a, double e, const Vector
         phiHist[j] = -e * (m_uNode[j] / 3.0) * r1[j] / den[j];
     }
     const double s = -a * m_N;
-    m_work.noalias() = s * m_A0;
-    for (Grid::Index k = 0; k < m_n; ++k)
+    if (m_solver == Solver::sparse)
     {
-        m_work(k, k) += m_W[k];
-        if (m_nonConservative)
-            m_work(k, k) += a * m_N * (nl.c / SI::gamma) * m_sqrtU[k];
-        if (m_ee)
+        // the same terms as below, into the tridiagonal part of m_stage (see solveSystem)
+        m_stage.setTridiagonal(s, m_A0lo, m_A0d, m_A0up);
+        Vector &lo = m_stage.lo, &d = m_stage.d, &up = m_stage.up;
+        for (Grid::Index k = 0; k < m_n; ++k)
         {
-            m_work(k, k) -= s * (nl.A[k] + nl.B[k]);
+            d[k] += m_W[k];
+            if (m_nonConservative)
+                d[k] += a * m_N * (nl.c / SI::gamma) * m_sqrtU[k];
+            if (m_ee)
+            {
+                d[k] -= s * (nl.A[k] + nl.B[k]);
+                if (k > 0)
+                    lo[k] += s * nl.A[k - 1];
+                if (k < m_n - 1)
+                    up[k] += s * nl.B[k + 1];
+            }
             if (k > 0)
-                m_work(k, k - 1) += s * nl.A[k - 1];
+            {
+                const double w = geff[k] / (m_dn[k] * m_dc[k]);
+                lo[k] += s * w;
+                d[k] -= s * w;
+            }
             if (k < m_n - 1)
-                m_work(k, k + 1) += s * nl.B[k + 1];
+            {
+                const double w = geff[k + 1] / (m_dn[k + 1] * m_dc[k]);
+                up[k] += s * w;
+                d[k] -= s * w;
+            }
         }
-        // field: (geff_{k+1} D_{k+1} - geff_k D_k)/dc_k, D_j = (f_j - f_{j-1})/dn_j
-        if (k > 0)
+        m_stage.factor();
+        m_denseCurrent = false;
+    }
+    else
+    {
+        m_work.noalias() = s * m_A0;
+        for (Grid::Index k = 0; k < m_n; ++k)
         {
-            const double w = geff[k] / (m_dn[k] * m_dc[k]);
-            m_work(k, k - 1) += s * w;
-            m_work(k, k) -= s * w;
-        }
-        if (k < m_n - 1)
-        {
-            const double w = geff[k + 1] / (m_dn[k + 1] * m_dc[k]);
-            m_work(k, k + 1) += s * w;
-            m_work(k, k) -= s * w;
+            m_work(k, k) += m_W[k];
+            if (m_nonConservative)
+                m_work(k, k) += a * m_N * (nl.c / SI::gamma) * m_sqrtU[k];
+            if (m_ee)
+            {
+                m_work(k, k) -= s * (nl.A[k] + nl.B[k]);
+                if (k > 0)
+                    m_work(k, k - 1) += s * nl.A[k - 1];
+                if (k < m_n - 1)
+                    m_work(k, k + 1) += s * nl.B[k + 1];
+            }
+            // field: (geff_{k+1} D_{k+1} - geff_k D_k)/dc_k, D_j = (f_j - f_{j-1})/dn_j
+            if (k > 0)
+            {
+                const double w = geff[k] / (m_dn[k] * m_dc[k]);
+                m_work(k, k - 1) += s * w;
+                m_work(k, k) -= s * w;
+            }
+            if (k < m_n - 1)
+            {
+                const double w = geff[k + 1] / (m_dn[k + 1] * m_dc[k]);
+                m_work(k, k + 1) += s * w;
+                m_work(k, k) -= s * w;
+            }
         }
     }
     x0 = rhs0 + (a * m_N) * divergence(phiHist);
@@ -1652,7 +1890,7 @@ void TimeDependentBoltzmann::writeCycleAverage(unsigned periods, double t0, doub
        << "\nPinelastic(eVm3/s) " << pw.inelastic << "\nPsuperelastic(eVm3/s) " << pw.superelastic
        << "\nPbalance(eVm3/s) " << pw.balance << "\nrelativeBalance " << pw.relativeBalance << "\nsteps "
        << m_diag.steps << "\nrejected " << m_diag.rejected << "\nsolves " << m_diag.solves << "\nkrylovIterations " << m_diag.krylovIterations
-       << "\nkrylovFallbacks " << m_diag.krylovFallbacks << "\nmaxNormDrift "
+       << "\nkrylovFallbacks " << m_diag.krylovFallbacks << sparseFallbacksLine() << "\nmaxNormDrift "
        << m_diag.maxNormDrift << "\ncells " << m_n << "\nuMax " << grid.uMax() << "\nwallTime " << wall << " s\n";
     Log<Message>::Notify("timeDependent cycle average:\n", os.str());
     PeriodicResult &res = m_periodicResult;
@@ -1731,7 +1969,7 @@ void TimeDependentBoltzmann::run()
     std::ostringstream summary;
     summary << "finalTime " << m_t << " s\nsteps " << m_diag.steps << "\nrejected " << m_diag.rejected
             << "\nsolves " << m_diag.solves << "\nkrylovIterations " << m_diag.krylovIterations
-       << "\nkrylovFallbacks " << m_diag.krylovFallbacks << "\nmaxNormDrift " << m_diag.maxNormDrift << "\nminEedf "
+       << "\nkrylovFallbacks " << m_diag.krylovFallbacks << sparseFallbacksLine() << "\nmaxNormDrift " << m_diag.maxNormDrift << "\nminEedf "
             << m_diag.minEedf << "\ncells " << m_n << "\nuMax " << m_ek.grid().uMax() << "\nwallTime " << elapsed
             << " s\n";
     Log<Message>::Notify("timeDependent finished:\n", summary.str());

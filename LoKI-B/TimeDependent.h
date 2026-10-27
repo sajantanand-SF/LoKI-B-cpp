@@ -137,8 +137,13 @@ struct TimeDependentOptions
      *  (solved with LinAlg::hessenberg, ~N^2), to a relative residual krylovTol, with dense LU as the fallback when
      *  it has not converged after krylovMaxIter iterations; lu: dense LU (~N^3). Matrices that are tridiagonal or
      *  upper Hessenberg always use TDMA or LinAlg::hessenberg.
+     *  sparse: every non-tridiagonal stage matrix (upper Hessenberg or not) is kept as its tridiagonal part plus a
+     *  sparse remainder (the inelastic/superelastic bands, ~1 % of N^2) and solved by GMRES preconditioned with the
+     *  tridiagonal part (TDMA), to krylovTol; ~nnz per iteration instead of ~N^2 per solve. If GMRES has not
+     *  converged after krylovMaxIter iterations, the dense matrix is built and solved as with automatic (counted in
+     *  sparseFallbacks).
      */
-    enum class LinearSolver { automatic, lu };
+    enum class LinearSolver { automatic, lu, sparse };
     LinearSolver linearSolver = LinearSolver::automatic;
     double krylovTol = 1e-14;
     unsigned krylovMaxIter = 30;
@@ -150,6 +155,36 @@ struct TimeDependentOptions
  */
 unsigned gmresHessenberg(const Matrix &M, Vector &b, double tol, unsigned maxIter, LinAlg::HessenbergWorkspace &hws,
                          Matrix &V, Matrix &Z);
+
+/** A stage matrix M = T + s*R (linearSolver sparse): T tridiagonal (lo(i) = M(i,i-1), d(i) = M(i,i),
+ *  up(i) = M(i,i+1)), R sparse with no entries on the three central diagonals.
+ */
+struct TridiagonalPlusSparse
+{
+    using RowMajorSparse = Eigen::SparseMatrix<double, Eigen::RowMajor>;
+    RowMajorSparse R;
+    double s = 1.0;
+    Vector lo, d, up;
+    /// sets T to s times the given diagonals (the tridiagonal part of the unscaled matrix)
+    void setTridiagonal(double scale, const Vector &lo0, const Vector &d0, const Vector &up0);
+    /// M(i,j) += v for |i - j| <= 1
+    void add(Eigen::Index i, Eigen::Index j, double v);
+    Vector apply(const Vector &x) const;
+    /// Thomas factorization of T, for solveTridiagonal
+    void factor();
+    /// x <- T^-1 x (after factor())
+    void solveTridiagonal(Vector &x) const;
+    /// the dense matrix M
+    void toDense(Matrix &M) const;
+
+private:
+    Vector m_c, m_inv;  // Thomas: modified super-diagonal and inverse pivots
+};
+
+/** Solve M x = b (x overwrites b) by GMRES from x0 = 0, right-preconditioned with the tridiagonal part T of M (after
+ *  M.factor()), to |b - M x| <= tol |b|. Returns the number of iterations, or 0 if not converged (b is then unchanged).
+ */
+unsigned gmresTridiagonal(const TridiagonalPlusSparse &M, Vector &b, double tol, unsigned maxIter, Matrix &V, Matrix &Z);
 
 class TimeDependentBoltzmann
 {
@@ -218,7 +253,7 @@ private:
     struct Diagnostics
     {
         unsigned long steps = 0, rejected = 0, solves = 0;
-        unsigned long krylovIterations = 0, krylovFallbacks = 0;
+        unsigned long krylovIterations = 0, krylovFallbacks = 0, sparseFallbacks = 0;
         double maxNormDrift = 0.0;
         double lastStep = 0.0;
         double minEedf = 0.0;
@@ -247,6 +282,12 @@ private:
     void resolve(Vector &x);
     /// solve m_work x = b (x overwrites b) by GMRES, preconditioned with the upper-Hessenberg part of m_work
     void solveKrylov(Vector &b);
+    /// solve m_stage x = b (x overwrites b) by GMRES, preconditioned with its tridiagonal part; dense if that fails
+    void solveSparse(Vector &b);
+    /// "\nsparseFallbacks <count>" for the summaries (linearSolver sparse), empty otherwise
+    std::string sparseFallbacksLine() const;
+    /// A0 f from the sparse form (tridiagonal part of A0 plus m_stage.R; linearSolver sparse)
+    Vector sparseA0Product(const Vector &f) const;
     /// implicit stage: (W - a N A(nl)) x = rhs, with nl = nl(x) iterated if iterate
     void stage(double a, double EoN2, const Vector &rhs, NonLinearState &nl, Vector &x, bool iterate);
     void prepareOutputState();
@@ -307,8 +348,13 @@ private:
     double m_Fc = -1.0;  // CIEff used for m_F
     Vector m_coefsCI;
     bool m_nonConservative = false;
-    enum class Solver { tdma, hessenberg, lu, krylov } m_solver = Solver::lu;
+    enum class Solver { tdma, hessenberg, lu, krylov, sparse } m_solver = Solver::lu;
     Matrix m_work;
+    // linearSolver sparse: the stage matrix, the tridiagonal part of A0, and the dense solver for fallbacks
+    TridiagonalPlusSparse m_stage;
+    Vector m_A0lo, m_A0d, m_A0up;
+    Solver m_denseSolver = Solver::krylov;
+    bool m_denseCurrent = false;  // m_work holds the current stage matrix (after a fallback)
     Matrix m_krylovV, m_krylovZ;  // GMRES basis and preconditioned basis (N x krylovMaxIter+1)
     bool m_luCurrent = false;     // krylov: m_lu holds the factorization of m_work (after a fallback)
     LinAlg::HessenbergWorkspace m_hws;
