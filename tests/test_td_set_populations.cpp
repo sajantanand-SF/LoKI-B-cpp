@@ -13,6 +13,8 @@
  *  coefficients extrapolated in time. The populations change at t = 2 us; at t = 4 us (~14 bulk relaxation times
  *  later) the state must equal that of a run with the new populations from t = 0 (the extrapolation restarts at the
  *  change instead of extrapolating across it).
+ *
+ *  Both cases run with integrator.linearSolver auto and sparse (setPopulations must rebuild the sparse operator).
  */
 
 #include "LoKI-B/Environment.h"
@@ -92,10 +94,14 @@ int main()
             });
         sim.run();
     }
+    for (const std::string solver : {"auto", "sparse"})
+    {
+    std::clog << "linearSolver " << solver << ":" << std::endl;
     // time-dependent: ground state only, then the populations of the steady run
     {
         const std::string td = "  timeDependent:\n    isOn: true\n    reducedField: 20\n    initialCondition:\n"
-                               "      type: maxwellian\n    finalTime: 1e-5\n";
+                               "      type: maxwellian\n    finalTime: 1e-5\n    integrator:\n      linearSolver: " +
+                               solver + "\n";
         const auto in = setup(dir, input, "td.in", "      - He(1S1) = 1.0\n      - He(2S3) = 0.0\n", td);
         loki::Simulation sim(in, loki::legacyToJSON(in));
         loki::TimeDependentBoltzmann *tdb = sim.timeDependent();
@@ -120,7 +126,8 @@ int main()
         const std::string td = "  timeDependent:\n    isOn: true\n    reducedField:\n      type: sinusoid\n"
                                "      amplitude: 28.284271247\n      frequency: 13.56e6\n    anisotropy: dynamic\n"
                                "    initialCondition:\n      type: maxwellian\n    finalTime: 1e-5\n"
-                               "    integrator:\n      nonLinear: extrapolate\n";
+                               "    integrator:\n      nonLinear: extrapolate\n      linearSolver: " +
+                               solver + "\n";
         const auto runRF = [&](const std::string &name, const std::string &pops, bool change) {
             const auto in = setup(dir, input, name, pops, td, "equalSharing");
             loki::Simulation sim(in, loki::legacyToJSON(in));
@@ -142,6 +149,7 @@ int main()
                   << "), k(2S3) = " << changed.second << " (" << fresh.second << ")" << std::endl;
         test_expr(std::abs(changed.first / fresh.first - 1) < 1e-5);
         test_expr(std::abs(changed.second / fresh.second - 1) < 1e-4);
+    }
     }
     fs::remove_all(dir);
     test_report;
