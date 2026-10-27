@@ -14,7 +14,13 @@
  *  later) the state must equal that of a run with the new populations from t = 0 (the extrapolation restarts at the
  *  change instead of extrapolating across it).
  *
- *  Both cases run with integrator.linearSolver auto and sparse (setPopulations must rebuild the sparse operator).
+ *  Third case (superelastic): as the first, with a copy of the He file in which 1S1 <-> 2S3 is reversible. With
+ *  He(2S3) = 0 the stage matrix is upper Hessenberg; after the change to He(2S3) = 0.05 the superelastic gains from
+ *  below (19.82 eV, ~250 cells under the diagonal) appear, so setPopulations must change the matrix structure (auto:
+ *  Hessenberg -> Hessenberg-preconditioned GMRES; sparse: new entries in the sparse remainder). The final state must
+ *  equal the steady LoKI-B solution with the new populations, including the superelastic rate coefficient.
+ *
+ *  All cases run with integrator.linearSolver auto and sparse (setPopulations must rebuild the sparse operator).
  */
 
 #include "LoKI-B/Environment.h"
@@ -33,9 +39,10 @@ namespace
 {
 
 const std::string exc2S3 = "e + He(1S1) -> e + He(2S3), Excitation";
+const std::string exc2S3rev = "e + He(1S1) <-> e + He(2S3), Excitation";
 
 fs::path setup(const fs::path &dir, const fs::path &input, const std::string &name, const std::string &pops,
-               const std::string &td, const std::string &sharing = "conservative")
+               const std::string &td, const std::string &sharing = "conservative", const fs::path &lxcat = {})
 {
     std::ofstream(dir / "He2S3_elastic.txt")
         << "Placeholder: zero elastic cross section for He(2S3) (test only).\n\nELASTIC\nHe(2S3)\n 1.371400e-4\n"
@@ -48,7 +55,7 @@ fs::path setup(const fs::path &dir, const fs::path &input, const std::string &na
       << "  gasPressure: 1333.22368\n  gasTemperature: 300\n  electronDensity: 1e19\n  chamberLength: 1.0\n"
       << "  chamberRadius: 1.0\nelectronKinetics:\n  isOn: true\n  eedfType: boltzmann\n"
       << "  ionizationOperatorType: " << sharing << "\n  growthModelType: temporal\n  includeEECollisions: false\n"
-      << "  LXCatFiles:\n    - " << (input / "Helium" / "He_LXCat.txt").string() << "\n    - "
+      << "  LXCatFiles:\n    - " << (lxcat.empty() ? input / "Helium" / "He_LXCat.txt" : lxcat).string() << "\n    - "
       << (dir / "He2S3_elastic.txt").string() << "\n  gasProperties:\n    mass: "
       << (input / "Databases" / "masses.txt").string() << "\n    fraction:\n      - He = 1\n"
       << "  stateProperties:\n    statisticalWeight:\n      - He(1S1) = 1.0\n      - He(2S3) = 3.0\n"
@@ -61,6 +68,23 @@ fs::path setup(const fs::path &dir, const fs::path &input, const std::string &na
     const fs::path in = dir / name;
     std::ofstream(in) << s.str();
     return in;
+}
+
+/// copy of the bundled He file with 1S1 <-> 2S3 reversible (LoKI-B reads the process from the COMMENT line)
+fs::path reversibleHe(const fs::path &dir, const fs::path &input)
+{
+    std::ifstream in(input / "Helium" / "He_LXCat.txt");
+    std::ostringstream s;
+    s << in.rdbuf();
+    std::string text = s.str();
+    const std::string from = "[e + He(1S1) -> e + He(2S3), Excitation]";
+    const auto pos = text.find(from);
+    if (pos == std::string::npos)
+        throw std::runtime_error("He_LXCat.txt: no 1S1 -> 2S3 excitation comment");
+    text.replace(pos, from.size(), "[e + He(1S1) <-> e + He(2S3), Excitation]");
+    const fs::path out = dir / "He_LXCat_2S3_reversible.txt";
+    std::ofstream(out) << text;
+    return out;
 }
 
 std::string describe(const loki::RateCoefficient &rc)
@@ -91,6 +115,25 @@ int main()
                 for (const auto &rc : cd.rateCoefficients())
                     if (describe(rc) == exc2S3)
                         kB = rc.inelastic;
+            });
+        sim.run();
+    }
+    // steady reference with the final populations and the reversible 1S1 <-> 2S3 excitation
+    const fs::path heRev = reversibleHe(dir, input);
+    double epsS = 0, kS = 0, kSupS = 0;
+    {
+        const auto in = setup(dir, input, "steady_rev.in", popsB, "", "conservative", heRev);
+        loki::Simulation sim(in, loki::legacyToJSON(in));
+        sim.obtainedResults().addListener(
+            [&](const loki::Grid &, const loki::Vector &, const loki::WorkingConditions &, const loki::Power &,
+                const loki::EedfCollisionDataMixture &cd, const loki::SwarmParameters &sp, const loki::Vector *) {
+                epsS = sp.meanEnergy;
+                for (const auto &rc : cd.rateCoefficients())
+                    if (describe(rc) == exc2S3rev)
+                    {
+                        kS = rc.inelastic;
+                        kSupS = rc.superelastic;
+                    }
             });
         sim.run();
     }
@@ -149,6 +192,35 @@ int main()
                   << "), k(2S3) = " << changed.second << " (" << fresh.second << ")" << std::endl;
         test_expr(std::abs(changed.first / fresh.first - 1) < 1e-5);
         test_expr(std::abs(changed.second / fresh.second - 1) < 1e-4);
+    }
+    // superelastic: the populations change adds the gains from below
+    {
+        const std::string td = "  timeDependent:\n    isOn: true\n    reducedField: 20\n    initialCondition:\n"
+                               "      type: maxwellian\n    finalTime: 1e-5\n    integrator:\n      linearSolver: " +
+                               solver + "\n";
+        const auto in = setup(dir, input, "td_rev.in", "      - He(1S1) = 1.0\n      - He(2S3) = 0.0\n", td,
+                              "conservative", heRev);
+        loki::Simulation sim(in, loki::legacyToJSON(in));
+        loki::TimeDependentBoltzmann *tdb = sim.timeDependent();
+        tdb->initialize();
+        tdb->advance(2e-6);
+        tdb->setPopulations({{"He(1S1)", 0.95}, {"He(2S3)", 0.05}});
+        tdb->advance(5e-6);
+        double k = 0, kSup = 0;
+        for (const auto &rc : tdb->rateCoefficients())
+            if (describe(rc) == exc2S3rev)
+            {
+                k = rc.inelastic;
+                kSup = rc.superelastic;
+            }
+        std::clog << "superelastic after setPopulations: <eps> = " << tdb->meanEnergy() << " eV (steady " << epsS
+                  << ", irreversible " << epsB << "), k(2S3) = " << k << " (" << kS << "), k_sup = " << kSup << " ("
+                  << kSupS << ")" << std::endl;
+        test_expr(std::abs(epsS / epsB - 1) > 1e-3);  // the superelastic gains matter at this level
+        test_expr(kSupS > 0.0);
+        test_expr(std::abs(tdb->meanEnergy() / epsS - 1) < 1e-6);
+        test_expr(std::abs(k / kS - 1) < 1e-6);
+        test_expr(std::abs(kSup / kSupS - 1) < 1e-6);
     }
     }
     fs::remove_all(dir);
