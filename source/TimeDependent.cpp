@@ -1411,6 +1411,7 @@ void TimeDependentBoltzmann::advance(double tEnd)
     std::sort(stops.begin(), stops.end());
     std::size_t iStop = 0;
     const double eps = 1e-12 * std::max(tEnd, m_opt.finalTime);
+    bool rejected = false;
 
     while (m_t < tEnd - eps)
     {
@@ -1421,13 +1422,16 @@ void TimeDependentBoltzmann::advance(double tEnd)
         if (m_opt.maxStep > 0)
             hTrial = std::min(hTrial, m_opt.maxStep);
         double h = hTrial;
-        if (m_frozen || m_t + h >= target - eps)
+        // land on the stop, stretching the step by up to eps; not right after a rejection, where the stretch would
+        // retry the rejected landing step for ever (the reduced step never gets below the gap to the stop)
+        if (m_frozen || m_t + h >= target || (!rejected && m_t + h >= target - eps))
             h = target - m_t;
         else if (m_t + 1.5 * h > target)
             h = 0.5 * (target - m_t);
 
         double err = 0;
         const bool ok = step(h, err);
+        rejected = !ok;
         ++m_diag.steps;
         if (m_diag.steps > m_opt.maxSteps)
             throw std::runtime_error("timeDependent: maxSteps exceeded.");
