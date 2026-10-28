@@ -123,6 +123,9 @@ target_link_libraries(test_td_krylov PRIVATE loki_cpp::loki-b)
 add_executable(test_td_sparse test_td_sparse.cpp)
 target_link_libraries(test_td_sparse PRIVATE loki_cpp::loki-b)
 
+add_executable(test_td_anderson test_td_anderson.cpp)
+target_link_libraries(test_td_anderson PRIVATE loki_cpp::loki-b)
+
 add_executable(test_td_constant_nu test_td_constant_nu.cpp)
 target_link_libraries(test_td_constant_nu PRIVATE loki_cpp::loki-b)
 
@@ -167,6 +170,7 @@ target_add_test(test_td_constant_nu)
 target_add_test(test_td_set_populations)
 target_add_test(test_td_krylov)
 target_add_test(test_td_sparse)
+target_add_test(test_td_anderson)
 
 if (LOKIB_COVERAGE)
   setup_target_for_coverage_gcovr_xml(

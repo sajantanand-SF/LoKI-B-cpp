@@ -316,6 +316,17 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
         stepsPerPeriod = static_cast<unsigned>(
             getDouble(pc, "stepsPerPeriod", anisotropy == Anisotropy::dynamic ? 128u : stepsPerPeriod));
         freezeTol = getDouble(pc, "freezeTol", freezeTol);
+        const std::string acc = getString(pc, "accelerator", "none");
+        if (acc == "none")
+            accelerator = Accelerator::none;
+        else if (acc == "anderson")
+            accelerator = Accelerator::anderson;
+        else
+            throw std::runtime_error("timeDependent.periodic: accelerator must be 'none' or 'anderson', not '" + acc + "'.");
+        andersonDepth = static_cast<unsigned>(getDouble(pc, "andersonDepth", andersonDepth));
+        andersonTol = getDouble(pc, "andersonTol", andersonTol);
+        if (andersonDepth < 1)
+            throw std::runtime_error("timeDependent.periodic: andersonDepth >= 1.");
         if (averagePeriods < 1 || samplesPerPeriod < 1 || stepsPerPeriod < 1 || minPeriods < 2)
             throw std::runtime_error("timeDependent.periodic: averagePeriods, samplesPerPeriod, stepsPerPeriod >= 1 and "
                                      "minPeriods >= 2.");
@@ -1563,6 +1574,64 @@ void TimeDependentBoltzmann::accumulate(double h, const Vector &fOld, double pfO
     m_accE2 += 0.5 * h * (e2Old + e2);
 }
 
+double AndersonMixer::update(const Vector &x, const Vector &g, Vector &next)
+{
+    const Vector r = m_w.cwiseProduct(g - x);
+    const double residual = r.cwiseAbs().maxCoeff();
+    if (residual > 10 * m_residualMin)
+    {
+        // the iteration is moving away: restart from the plain map value
+        m_dR.clear();
+        m_dG.clear();
+        ++m_restarts;
+    }
+    else if (m_rOld.size() > 0)
+    {
+        m_dR.push_back(r - m_rOld);
+        m_dG.push_back(g - m_gOld);
+        if (m_dR.size() > m_depth)
+        {
+            m_dR.erase(m_dR.begin());
+            m_dG.erase(m_dG.begin());
+        }
+    }
+    m_residualMin = std::min(m_residualMin, residual);
+    m_rOld = r;
+    m_gOld = g;
+    next = g;
+    if (!m_dR.empty())
+    {
+        Matrix R(r.size(), static_cast<Eigen::Index>(m_dR.size()));
+        for (std::size_t k = 0; k < m_dR.size(); ++k)
+            R.col(static_cast<Eigen::Index>(k)) = m_dR[k];
+        const Vector gamma = R.colPivHouseholderQr().solve(r);
+        for (std::size_t k = 0; k < m_dG.size(); ++k)
+            next -= gamma[static_cast<Eigen::Index>(k)] * m_dG[k];
+    }
+    return residual;
+}
+
+Vector TimeDependentBoltzmann::periodState() const
+{
+    if (!m_dynF1)
+        return m_f;
+    Vector x(m_n + m_f1.size());
+    x << m_f, m_f1;
+    return x;
+}
+
+void TimeDependentBoltzmann::setPeriodState(const Vector &x)
+{
+    // a mixed state can undershoot zero in the far tail, where f0 is ~1e-10 of its maximum or less
+    m_f = x.head(m_n).cwiseMax(0.0);
+    m_f /= norm(m_f);
+    if (m_dynF1)
+        m_f1 = x.tail(m_f1.size());
+    m_c = ciEff(m_f);
+    m_tPrev = -1.0;  // no extrapolation of the nonlinear coefficients across the jump
+    m_diag.minEedf = std::min(m_diag.minEedf, m_f.minCoeff());
+}
+
 void TimeDependentBoltzmann::runPeriodic()
 {
     const auto begin = std::chrono::steady_clock::now();
@@ -1572,16 +1641,24 @@ void TimeDependentBoltzmann::runPeriodic()
     {
         conv.open(m_outFolder / "periodConvergence.txt");
         conv << "# period t_end(s) delta ratio remainingEstimate CIEffbar(m3/s) meanEnergybar(eV) Pfieldbar(eVm3/s) "
-                "steps\n" << std::scientific << std::setprecision(8);
+                "steps";
+        if (m_opt.accelerator != TimeDependentOptions::Accelerator::none)
+            conv << " frozen mapResidual mixed";
+        conv << '\n' << std::scientific << std::setprecision(8);
     }
     Vector fbarOld;
     double cOld = 0, pOld = 0, deltaOld = 0;
     unsigned p = 0, compared = 0;  // compared: period-to-period comparisons on the current (adaptive or frozen) map
     bool converged = false;
+    // Anderson mixing on the period map (accelerator anderson): history of the scaled residuals r = w (P_T(x) - x)
+    // and of the map values P_T(x), as differences between successive periods
+    bool mixing = m_opt.accelerator == TimeDependentOptions::Accelerator::anderson;
+    AndersonMixer mixer(m_opt.andersonDepth);
     for (; p < m_opt.maxPeriods && !converged; ++p)
     {
         const double t0 = m_t;
         const bool frozenBefore = m_frozen;
+        const Vector xStart = mixing ? periodState() : Vector();
         m_opt.sampleTimes = {t0 + T};  // one timeSeries row per period
         m_nextSample = 0;
         resetAccumulators();
@@ -1615,10 +1692,52 @@ void TimeDependentBoltzmann::runPeriodic()
                                      m_schedule.size(), " steps per period).");
             }
         }
+        // Anderson mixing, on the fixed map only (frozen schedule, or fixed steps)
+        double residual = 0;
+        bool mixed = false;
+        if (mixing && !converged && p > 0 && ((frozenBefore && m_frozen) || m_opt.fixedStep > 0))
+        {
+            const Vector g = periodState();
+            if (!mixer.hasWeights())
+            {
+                // fixed weights, as the convergence test: f0 relative to itself, f1 relative to its scale
+                Vector w(g.size());
+                const double fmax = g.head(m_n).cwiseAbs().maxCoeff();
+                for (Grid::Index i = 0; i < m_n; ++i)
+                    w[i] = 1.0 / (std::abs(g[i]) + m_opt.periodicAtol * fmax);
+                if (m_dynF1)
+                {
+                    const double smax = m_f1Scale.maxCoeff();
+                    for (Grid::Index j = 0; j < m_f1.size(); ++j)
+                        w[m_n + j] = 1.0 / (m_f1Scale[j] + m_opt.periodicAtol * smax);
+                }
+                mixer.setWeights(w);
+            }
+            Vector x;
+            residual = mixer.update(xStart, g, x);
+            m_diag.andersonRestarts = mixer.restarts();
+            compared = 0;  // this period started from a mixed state: not a period-to-period comparison
+            if (residual < (m_opt.andersonTol > 0 ? m_opt.andersonTol : 0.01 * m_opt.periodicTol))
+            {
+                mixing = false;  // plain periods from here on decide convergence
+                Log<Message>::Notify("timeDependent: Anderson mixing off after period ", p + 1, " (map residual ",
+                                     residual, ", ", m_diag.andersonSteps, " mixed periods).");
+            }
+            else
+            {
+                setPeriodState(x);
+                mixed = true;
+                ++m_diag.andersonSteps;
+            }
+        }
         if (conv.is_open())
+        {
             conv << p + 1 << ' ' << m_t << ' ' << delta << ' ' << ratio << ' ' << remaining << ' ' << cbar << ' '
-                 << meanEnergy(fbar) << ' ' << pbar << ' ' << m_diag.steps << ' ' << (m_frozen ? 1 : 0) << '\n'
-                 << std::flush;
+                 << meanEnergy(fbar) << ' ' << pbar << ' ' << m_diag.steps << ' ' << (m_frozen ? 1 : 0);
+            if (m_opt.accelerator != TimeDependentOptions::Accelerator::none)
+                conv << ' ' << residual << ' ' << (mixed ? 1 : 0);
+            conv << '\n' << std::flush;
+        }
         fbarOld = fbar;
         cOld = cbar;
         pOld = pbar;
@@ -1735,9 +1854,12 @@ void TimeDependentBoltzmann::writeCycleAverage(unsigned periods, double t0, doub
        << m_diag.steps << "\nrejected " << m_diag.rejected << "\nsolves " << m_diag.solves << "\nkrylovIterations " << m_diag.krylovIterations
        << "\nkrylovFallbacks " << m_diag.krylovFallbacks << sparseFallbacksLine() << "\nmaxNormDrift "
        << m_diag.maxNormDrift << "\ncells " << m_n << "\nuMax " << grid.uMax() << "\nwallTime " << wall << " s\n";
+    if (m_opt.accelerator != TimeDependentOptions::Accelerator::none)
+        os << "andersonSteps " << m_diag.andersonSteps << "\nandersonRestarts " << m_diag.andersonRestarts << '\n';
     Log<Message>::Notify("timeDependent cycle average:\n", os.str());
     PeriodicResult &res = m_periodicResult;
     res.periods = periods;
+    res.andersonSteps = m_diag.andersonSteps;
     res.reducedFieldRMS = erms;
     res.energy = grid.getCells();
     res.eedf = fbar;
@@ -1815,6 +1937,8 @@ void TimeDependentBoltzmann::run()
        << "\nkrylovFallbacks " << m_diag.krylovFallbacks << sparseFallbacksLine() << "\nmaxNormDrift " << m_diag.maxNormDrift << "\nminEedf "
             << m_diag.minEedf << "\ncells " << m_n << "\nuMax " << m_ek.grid().uMax() << "\nwallTime " << elapsed
             << " s\n";
+    if (m_opt.accelerator != TimeDependentOptions::Accelerator::none)
+        summary << "andersonSteps " << m_diag.andersonSteps << "\nandersonRestarts " << m_diag.andersonRestarts << '\n';
     Log<Message>::Notify("timeDependent finished:\n", summary.str());
     if (m_outFolder.empty())
         return;

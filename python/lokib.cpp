@@ -171,6 +171,7 @@ PYBIND11_MODULE(lokib, m)
                  const auto &r = td.periodicResult();
                  py::dict d;
                  d["periods"] = r.periods;
+                 d["anderson_steps"] = r.andersonSteps;
                  d["converged"] = r.converged;
                  d["reduced_field_rms"] = r.reducedFieldRMS;
                  d["energy"] = r.energy;
