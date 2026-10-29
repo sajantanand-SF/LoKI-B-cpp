@@ -208,6 +208,18 @@ public:
      *  f1 (dynamic anisotropy) is the harmonic f1 of this f0 for a sinusoid, the quasi-static f1 otherwise.
      */
     void initialize(const Vector &u, const Vector &f0);
+    /** Warm start with the anisotropy too: as initialize(u, f0), and f1 (dynamic anisotropy) is the given f1 on the
+     *  face energies uFaces (eV; interpolated linearly onto this grid's faces, zero beyond uFaces.back()) instead of
+     *  the quasi-static f1, which during a fast rise overstates the field power (f1 lags the field by ~1/nu_m): a
+     *  restarted solver (regridding, a redone step) continues the electrons' momentum state.
+     */
+    void initialize(const Vector &u, const Vector &f0, const Vector &uFaces, const Vector &f1);
+    /** Multiply the configured reduced-field waveform by s from the current time on (a coupled model's power
+     *  control). The state (f0, f1, CIEff, step size) carries on; a change of s is a jump of the field at the current
+     *  time. Reported fields (samples, emitted states) include s.
+     */
+    void setFieldScale(double s);
+    double fieldScale() const { return m_fieldScale; }
     /** March to the periodic steady state and average over averagePeriods periods (periodic waveforms; run() calls
      *  it after initialize()). The results are in periodicResult().
      */
@@ -323,7 +335,9 @@ private:
     void sample();
     void openOutput();
     void emitState(const std::string &jobFolder);
-    void initializeImpl(const Vector *u, const Vector *f0);
+    void initializeImpl(const Vector *u, const Vector *f0, const Vector *uFaces = nullptr,
+                        const Vector *f1 = nullptr);
+    double field(double t) const { return m_fieldScale * (*m_waveform)(t); }  // Td
     void advancePeriod(double t0, double T);
     /// the period-start state x = (f0, f1) (f1 only with dynamic anisotropy), and its inverse (renormalizes f0)
     Vector periodState() const;
@@ -377,6 +391,7 @@ private:
     Vector m_f1;                     // f1 on the n+1 faces (dynamic anisotropy)
     Vector m_uNode, m_sqrtUNode, m_dn, m_dc;  // face energies, sqrt, face spacing (cell centre to centre), cell widths
     Vector m_f1Scale;                // per-face f1 magnitude for the error weights
+    double m_fieldScale = 1.0;       // setFieldScale: the waveform's factor
     double m_ne = 0.0, m_dlnneDt = 0.0;
 
     // time integrals (trapezoidal rule over accepted steps), used for period averages

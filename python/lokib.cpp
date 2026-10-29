@@ -163,6 +163,14 @@ PYBIND11_MODULE(lokib, m)
         .def("initialize", py::overload_cast<const Vector &, const Vector &>(&TimeDependentBoltzmann::initialize),
              py::arg("u"), py::arg("f0"), py::call_guard<py::gil_scoped_release>(),
              "warm start: as initialize(), with f0 (on energies u, eV) as the initial EEDF")
+        .def("initialize",
+             py::overload_cast<const Vector &, const Vector &, const Vector &, const Vector &>(
+                 &TimeDependentBoltzmann::initialize),
+             py::arg("u"), py::arg("f0"), py::arg("u_faces"), py::arg("f1"), py::call_guard<py::gil_scoped_release>(),
+             "warm start with f0 (on cell energies u) and the dynamic anisotropy f1 (on face energies u_faces)")
+        .def("set_field_scale", &TimeDependentBoltzmann::setFieldScale, py::arg("s"),
+             "multiply the reduced-field waveform by s from the current time on (state carried on)")
+        .def_property_readonly("field_scale", &TimeDependentBoltzmann::fieldScale)
         .def("advance", &TimeDependentBoltzmann::advance, py::arg("t_end"), py::call_guard<py::gil_scoped_release>())
         .def("run_periodic", &TimeDependentBoltzmann::runPeriodic, py::call_guard<py::gil_scoped_release>(),
              "march to the periodic steady state and average (after initialize)")

@@ -436,7 +436,7 @@ void TimeDependentBoltzmann::checkSupported() const
 
 double TimeDependentBoltzmann::reducedField2(double t) const
 {
-    const double e = (*m_waveform)(t) * SI::Townsend;
+    const double e = field(t) * SI::Townsend;
     return e * e;
 }
 
@@ -956,7 +956,7 @@ Vector TimeDependentBoltzmann::harmonicF1(const Vector &f, double A, double omeg
 
 double TimeDependentBoltzmann::reducedFieldSI(double t) const
 {
-    return (*m_waveform)(t) * SI::Townsend;
+    return field(t) * SI::Townsend;
 }
 
 Vector TimeDependentBoltzmann::fieldCoefficientNodes(double c) const
@@ -1291,13 +1291,38 @@ void TimeDependentBoltzmann::initialize(const Vector &u, const Vector &f0)
     initializeImpl(&u, &f0);
 }
 
-void TimeDependentBoltzmann::initializeImpl(const Vector *u0, const Vector *f00)
+void TimeDependentBoltzmann::initialize(const Vector &u, const Vector &f0, const Vector &uFaces, const Vector &f1)
+{
+    if (u.size() != f0.size() || u.size() < 2)
+        throw std::runtime_error("timeDependent: initialize(u, f0, ...) needs energies and EEDF values of equal length >= 2.");
+    if (uFaces.size() != f1.size() || uFaces.size() < 2)
+        throw std::runtime_error("timeDependent: initialize(..., uFaces, f1) needs face energies and f1 values of equal "
+                                 "length >= 2.");
+    initializeImpl(&u, &f0, &uFaces, &f1);
+}
+
+void TimeDependentBoltzmann::setFieldScale(double s)
+{
+    if (!std::isfinite(s))
+        throw std::runtime_error("timeDependent: setFieldScale needs a finite factor.");
+    if (m_dynF1 && m_f1Scale.size() > 0)
+    {
+        if (m_fieldScale != 0.0 && s != 0.0)
+            m_f1Scale *= std::abs(s / m_fieldScale);  // the f1 error weights scale with the field (f1 ~ E)
+        else if (s != 0.0)
+            m_f1Scale = quasiStaticF1(m_f, std::abs(s) * m_waveform->peak(0.0, horizon()) * SI::Townsend, m_c)
+                            .cwiseAbs();
+    }
+    m_fieldScale = s;
+}
+
+void TimeDependentBoltzmann::initializeImpl(const Vector *u0, const Vector *f00, const Vector *uF, const Vector *f1F)
 {
     const bool warm = u0 != nullptr;
     const Grid &grid = m_ek.grid();
     if (m_opt.gridFromPeakField && grid.smartGrid())
     {
-        const double peak = m_waveform->peak(0.0, horizon());
+        const double peak = std::abs(m_fieldScale) * m_waveform->peak(0.0, horizon());
         Log<Message>::Notify("timeDependent: choosing the energy grid with the smart grid at the peak field ", peak,
                              " Td.");
         m_wc.updateReducedField(peak);
@@ -1330,9 +1355,9 @@ void TimeDependentBoltzmann::initializeImpl(const Vector *u0, const Vector *f00)
     }
     else if (m_opt.initial == TimeDependentOptions::Initial::steadyState)
     {
-        double e0 = (*m_waveform)(0.0);
+        double e0 = field(0.0);
         if (m_opt.initialReducedField == "rms")
-            e0 = m_waveform->rms(0.0, horizon());
+            e0 = std::abs(m_fieldScale) * m_waveform->rms(0.0, horizon());
         else if (m_opt.initialReducedField == "value")
             e0 = m_opt.initialReducedFieldValue;
         Log<Message>::Notify("timeDependent: initial state is the steady solution at ", e0, " Td.");
@@ -1367,7 +1392,28 @@ void TimeDependentBoltzmann::initializeImpl(const Vector *u0, const Vector *f00)
     {
         m_f1 = harmonicStart ? harmonicF1(m_f, sa * SI::Townsend, sw, sphi, 0.0, m_c)
                              : quasiStaticF1(m_f, reducedFieldSI(0.0), m_c);
-        const double emax = m_waveform->peak(0.0, horizon()) * SI::Townsend;
+        if (uF != nullptr)
+        {
+            // the given f1 (face energies uF), linear onto this grid's faces, 0 beyond its last face
+            const Vector &ue = *uF, &g = *f1F;
+            const Vector &nodes = grid.getNodes();
+            Grid::Index j = 0;
+            for (Grid::Index k = 0; k < static_cast<Grid::Index>(m_f1.size()); ++k)
+            {
+                const double e = nodes[k];
+                if (e > ue[ue.size() - 1] || e < ue[0])
+                {
+                    m_f1[k] = 0.0;
+                    continue;
+                }
+                while (j + 2 < ue.size() && ue[j + 1] < e)
+                    ++j;
+                const double w = std::clamp((e - ue[j]) / (ue[j + 1] - ue[j]), 0.0, 1.0);
+                m_f1[k] = g[j] + w * (g[j + 1] - g[j]);
+            }
+            Log<Message>::Notify("timeDependent: initial f1 is the given anisotropy (warm start).");
+        }
+        const double emax = std::abs(m_fieldScale) * m_waveform->peak(0.0, horizon()) * SI::Townsend;
         m_f1Scale = quasiStaticF1(m_f, emax, m_c).cwiseAbs();
     }
     m_t = 0.0;
@@ -1488,7 +1534,7 @@ void TimeDependentBoltzmann::openOutput()
 
 void TimeDependentBoltzmann::sample()
 {
-    const double EoN = (*m_waveform)(m_t);
+    const double EoN = field(m_t);
     const Grid &grid = m_ek.grid();
     m_wc.updateReducedField(EoN);
     m_ek.eedf = m_f;
@@ -1531,7 +1577,7 @@ void TimeDependentBoltzmann::sample()
 void TimeDependentBoltzmann::emitState(const std::string &jobFolder)
 {
     const Grid &grid = m_ek.grid();
-    const double EoN = (*m_waveform)(m_t);
+    const double EoN = field(m_t);
     m_wc.setCurrentJobFolder(jobFolder);
     m_wc.updateReducedField(EoN);
     m_ek.eedf = m_f;
@@ -1823,7 +1869,7 @@ void TimeDependentBoltzmann::writeCycleAverage(unsigned periods, double t0, doub
     const Grid &grid = m_ek.grid();
     const Vector fbar = m_accF / m_accT;
     const double cbar = m_accC / m_accT, pfield = m_accPfield / m_accT, pgrowth = m_accPgrowth / m_accT;
-    const double erms = m_waveform->rms(0.0, m_waveform->period());  // exact; m_accE2 is the quadrature value
+    const double erms = std::abs(m_fieldScale) * m_waveform->rms(0.0, m_waveform->period());  // exact; m_accE2 is the quadrature value
     const double ermsQuad = std::sqrt(m_accE2 / m_accT) / SI::Townsend;
 
     // LoKI-B files for the cycle-averaged state: the EEDF, rate coefficients and every power term that is linear
