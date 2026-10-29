@@ -1415,6 +1415,8 @@ void TimeDependentBoltzmann::initializeImpl(const Vector *u0, const Vector *f00,
         }
         const double emax = std::abs(m_fieldScale) * m_waveform->peak(0.0, horizon()) * SI::Townsend;
         m_f1Scale = quasiStaticF1(m_f, emax, m_c).cwiseAbs();
+        if (uF != nullptr)  // a given f1 (e.g. decaying after the field went off, peak 0) sets the scale too: else its
+            m_f1Scale = m_f1Scale.cwiseMax(m_f1.cwiseAbs());  // error weights shrink with it and the steps with them
     }
     m_t = 0.0;
     m_tPrev = -1.0;
