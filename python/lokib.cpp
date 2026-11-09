@@ -197,6 +197,12 @@ PYBIND11_MODULE(lokib, m)
              py::call_guard<py::gil_scoped_release>())
         .def("set_electron_density", &TimeDependentBoltzmann::setElectronDensity, py::arg("ne"),
              py::arg("dlnne_dt") = 0.0)
+        .def("set_source", &TimeDependentBoltzmann::setSource, py::arg("g"), py::arg("nu"),
+             "external electron source from now on: df/dt += nu (g - f), g on the cell energies (normalized here), nu "
+             "(1/s) the new electrons per electron per second; nu = 0 removes it (initialize() does too)")
+        .def_property_readonly("source_rate", &TimeDependentBoltzmann::sourceRate)
+        .def_property_readonly("source_power", &TimeDependentBoltzmann::sourcePower,
+                               "nu <u>_g (eV/s per electron): the energy the new electrons bring")
         .def("rate_coefficients", [](TimeDependentBoltzmann &td) { return ratesDict(td.rateCoefficients()); })
         .def_property_readonly("time", &TimeDependentBoltzmann::time)
         .def_property_readonly("eedf", [](const TimeDependentBoltzmann &td) { return Vector(td.eedf()); })

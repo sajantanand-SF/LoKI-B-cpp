@@ -260,6 +260,18 @@ public:
      */
     void setPopulations(const std::map<std::string, double> &populations);
     void setElectronDensity(double ne, double dlnneDt = 0.0);
+    /** External electron source (e.g. electrons released by heavy-particle ionization, whose energy the chemistry
+     *  knows): from now on df/dt gets nu (g - f), and the anisotropy df1/dt gets -nu f1. g (on the cell energies,
+     *  >= 0, normalized here as f) is the energy distribution of the new electrons; nu (1/s) is their production
+     *  rate per electron, R / ne. The -nu f term keeps f normalized: the source's electrons are part of ne, and the
+     *  losses of ne are taken to be energy independent. The term is linear in f and enters the implicit stages, so
+     *  a constant source costs no restart and no extra solves. nu = 0 removes it; initialize() removes it too.
+     */
+    void setSource(const Vector &g, double nu);
+    double sourceRate() const { return m_srcNu; }
+    /// the energy the source adds per electron, nu <u>_g (eV/s): gross, before the -nu f term (nu <u>_f) takes back
+    /// the mean energy of the electrons it dilutes
+    double sourcePower() const { return m_srcNu > 0.0 ? m_srcNu * meanEnergy(m_srcG) : 0.0; }
     /// rate coefficients (inelastic, superelastic) of the current EEDF, in the order of the LoKI-B output
     std::vector<RateCoefficient> rateCoefficients();
 
@@ -393,6 +405,10 @@ private:
     Vector m_f1Scale;                // per-face f1 magnitude for the error weights
     double m_fieldScale = 1.0;       // setFieldScale: the waveform's factor
     double m_ne = 0.0, m_dlnneDt = 0.0;
+    Vector m_srcG;          // setSource: the new electrons' distribution (normalized), empty without a source
+    double m_srcNu = 0.0;   // setSource: their production rate per electron (1/s)
+    /// W df/dt from the source, nu W (g - f) (zero without a source)
+    Vector sourceTerm(const Vector &f) const;
 
     // time integrals (trapezoidal rule over accepted steps), used for period averages
     bool m_accumulate = false;

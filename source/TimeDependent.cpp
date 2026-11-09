@@ -614,6 +614,8 @@ Vector TimeDependentBoltzmann::applyNA(const Vector &f, double EoN2, const NonLi
             if (k < m_n - 1)
                 r[k] += nl.B[k + 1] * f[k + 1];
         }
+    if (m_srcNu > 0.0)
+        return m_N * r + sourceTerm(f);
     return m_N * r;
 }
 
@@ -632,7 +634,7 @@ void TimeDependentBoltzmann::solveSystem(double a, double EoN2, const NonLinearS
                 m_stage.add(it.row(), it.col(), s * EoN2 * it.value());
         for (Grid::Index k = 0; k < m_n; ++k)
         {
-            m_stage.d[k] += m_W[k];
+            m_stage.d[k] += m_W[k] * (1.0 + a * m_srcNu);
             if (m_nonConservative)
                 m_stage.d[k] += a * m_N * (nl.c / SI::gamma) * m_sqrtU[k];
             if (m_ee)
@@ -655,7 +657,7 @@ void TimeDependentBoltzmann::solveSystem(double a, double EoN2, const NonLinearS
             m_work(it.row(), it.col()) += s * EoN2 * it.value();
     for (Grid::Index k = 0; k < m_n; ++k)
     {
-        m_work(k, k) += m_W[k];
+        m_work(k, k) += m_W[k] * (1.0 + a * m_srcNu);
         if (m_nonConservative)
             m_work(k, k) += a * m_N * (nl.c / SI::gamma) * m_sqrtU[k];
         if (m_ee)
@@ -758,7 +760,9 @@ void TimeDependentBoltzmann::solveSparse(Vector &b)
 void TimeDependentBoltzmann::stage(double a, double EoN2, const Vector &rhs, NonLinearState &nl, Vector &x,
                                    bool iterate)
 {
-    x = rhs;
+    // the source's constant part a nu W g joins the right-hand side (its -nu f part is in the matrix)
+    const Vector rhsS = m_srcNu > 0.0 ? Vector(rhs + (a * m_srcNu) * m_W.cwiseProduct(m_srcG)) : rhs;
+    x = rhsS;
     solveSystem(a, EoN2, nl, x);
     if (!iterate || (!m_nonConservative && !m_ee))
         return;
@@ -773,7 +777,7 @@ void TimeDependentBoltzmann::stage(double a, double EoN2, const Vector &rhs, Non
         const Vector xOld = x;
         if (done && !m_ee)
             break;
-        x = rhs;
+        x = rhsS;
         solveSystem(a, EoN2, nl, x);
         if (m_ee)
         {
@@ -1003,7 +1007,7 @@ Vector TimeDependentBoltzmann::f1Derivative(const Vector &f, const Vector &f1, d
     for (Grid::Index j = 1; j < m_n; ++j)
     {
         const double omega = m_uNode[j] / (3.0 * g[j]);
-        z[j] = m_N * SI::gamma * m_sqrtUNode[j] * (-omega * f1[j] - e * D[j]);
+        z[j] = m_N * SI::gamma * m_sqrtUNode[j] * (-omega * f1[j] - e * D[j]) - m_srcNu * f1[j];
     }
     return z;
 }
@@ -1027,6 +1031,8 @@ Vector TimeDependentBoltzmann::applyNADynamic(const Vector &f, const Vector &f1,
             if (k < m_n - 1)
                 r[k] += nl.B[k + 1] * f[k + 1];
         }
+    if (m_srcNu > 0.0)
+        return m_N * r + sourceTerm(f);
     return m_N * r;
 }
 
@@ -1053,7 +1059,7 @@ void TimeDependentBoltzmann::solveSystemDynamic(double a, double e, const Vector
     for (Grid::Index j = 1; j < m_n; ++j)
     {
         const double nu = m_N * SI::gamma * m_sqrtUNode[j] * m_uNode[j] / (3.0 * g[j]);
-        den[j] = 1.0 + a * nu;
+        den[j] = 1.0 + a * (nu + m_srcNu);
         geff[j] = e * e * g[j] * (a * nu / den[j]);
         phiHist[j] = -e * (m_uNode[j] / 3.0) * r1[j] / den[j];
     }
@@ -1065,7 +1071,7 @@ void TimeDependentBoltzmann::solveSystemDynamic(double a, double e, const Vector
         Vector &lo = m_stage.lo, &d = m_stage.d, &up = m_stage.up;
         for (Grid::Index k = 0; k < m_n; ++k)
         {
-            d[k] += m_W[k];
+            d[k] += m_W[k] * (1.0 + a * m_srcNu);
             if (m_nonConservative)
                 d[k] += a * m_N * (nl.c / SI::gamma) * m_sqrtU[k];
             if (m_ee)
@@ -1097,7 +1103,7 @@ void TimeDependentBoltzmann::solveSystemDynamic(double a, double e, const Vector
         m_work.noalias() = s * m_A0;
         for (Grid::Index k = 0; k < m_n; ++k)
         {
-            m_work(k, k) += m_W[k];
+            m_work(k, k) += m_W[k] * (1.0 + a * m_srcNu);
             if (m_nonConservative)
                 m_work(k, k) += a * m_N * (nl.c / SI::gamma) * m_sqrtU[k];
             if (m_ee)
@@ -1124,6 +1130,8 @@ void TimeDependentBoltzmann::solveSystemDynamic(double a, double e, const Vector
         }
     }
     x0 = rhs0 + (a * m_N) * divergence(phiHist);
+    if (m_srcNu > 0.0)
+        x0 += (a * m_srcNu) * m_W.cwiseProduct(m_srcG);
     m_luCurrent = false;
     if (m_solver == Solver::lu)
         m_lu.compute(m_work);
@@ -1320,6 +1328,8 @@ void TimeDependentBoltzmann::initializeImpl(const Vector *u0, const Vector *f00,
 {
     const bool warm = u0 != nullptr;
     const Grid &grid = m_ek.grid();
+    m_srcG.resize(0);  // setSource: the grid may change; set it again after initialize()
+    m_srcNu = 0.0;
     if (m_opt.gridFromPeakField && grid.smartGrid())
     {
         const double peak = std::abs(m_fieldScale) * m_waveform->peak(0.0, horizon());
@@ -1958,6 +1968,37 @@ void TimeDependentBoltzmann::setElectronDensity(double ne, double dlnneDt)
     m_ne = ne;
     m_dlnneDt = dlnneDt;
     m_tPrev = -1.0;
+}
+
+void TimeDependentBoltzmann::setSource(const Vector &g, double nu)
+{
+    if (!std::isfinite(nu) || nu < 0.0)
+        throw std::runtime_error("timeDependent: setSource needs a finite rate nu >= 0.");
+    if (nu == 0.0)
+    {
+        m_srcG.resize(0);
+        m_srcNu = 0.0;
+        m_tPrev = -1.0;
+        return;
+    }
+    if (g.size() != m_n)
+        throw std::runtime_error("timeDependent: setSource needs g on the " + std::to_string(m_n) +
+                                 " cell energies (after initialize()); got " + std::to_string(g.size()) + ".");
+    if (!g.allFinite() || (g.array() < 0.0).any())
+        throw std::runtime_error("timeDependent: setSource needs a finite g >= 0.");
+    const double s = norm(g);
+    if (!(s > 0.0))
+        throw std::runtime_error("timeDependent: setSource needs a g with electrons in it (norm > 0).");
+    m_srcG = g / s;
+    m_srcNu = nu;
+    m_tPrev = -1.0;  // no extrapolation of the nonlinear coefficients across the change
+}
+
+Vector TimeDependentBoltzmann::sourceTerm(const Vector &f) const
+{
+    if (!(m_srcNu > 0.0))
+        return Vector::Zero(m_n);
+    return m_srcNu * m_W.cwiseProduct(m_srcG - f);
 }
 
 std::vector<RateCoefficient> TimeDependentBoltzmann::rateCoefficients()
