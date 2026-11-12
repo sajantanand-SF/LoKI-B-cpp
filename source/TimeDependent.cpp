@@ -293,6 +293,7 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
             throw std::runtime_error("timeDependent: initialCondition.type must be 'steadyState' or 'maxwellian'.");
     }
     gridFromPeakField = getBool(cnf, "gridFromPeakField", true);
+    highFrequency = getBool(cnf, "highFrequency", false);
     const std::string an = getString(cnf, "anisotropy", "quasiStatic");
     if (an == "quasiStatic")
         anisotropy = Anisotropy::quasiStatic;
@@ -406,6 +407,16 @@ TimeDependentOptions::TimeDependentOptions(const json_type &cnf)
     }
 }
 
+namespace
+{
+std::string hfFrequencyText(double omega)
+{
+    std::ostringstream s;
+    s << std::setprecision(6) << omega / (2 * Constant::pi) << " Hz";
+    return s.str();
+}
+} // namespace
+
 TimeDependentBoltzmann::TimeDependentBoltzmann(ElectronKineticsBoltzmann &ek, WorkingConditions &wc,
                                                const json_type &cnf, const std::filesystem::path &basePath)
     : m_ek(ek), m_wc(wc), m_opt(cnf.at("electronKinetics").at("timeDependent")),
@@ -416,6 +427,7 @@ TimeDependentBoltzmann::TimeDependentBoltzmann(ElectronKineticsBoltzmann &ek, Wo
         m_outFolder = std::filesystem::path(LOKIB_OUTPUT_DIR) / cnf.at("output").at("folder").get<std::string>() /
                       "timeDependent";
     checkSupported();
+    m_WoN = m_opt.highFrequency ? wc.reducedExcFreqSI() : 0.0;
     if (m_opt.periodic && !(m_waveform->period() > 0))
         throw std::runtime_error("timeDependent: periodic mode needs a periodic reducedField (sinusoid, or table with "
                                  "periodic: true).");
@@ -425,9 +437,10 @@ TimeDependentBoltzmann::TimeDependentBoltzmann(ElectronKineticsBoltzmann &ek, Wo
 
 void TimeDependentBoltzmann::checkSupported() const
 {
-    if (m_wc.reducedExcFreqSI() != 0.0)
-        throw std::runtime_error("timeDependent: excitationFrequency must be 0; the field oscillation is "
-                                 "resolved in time through timeDependent.reducedField.");
+    if (m_wc.reducedExcFreqSI() != 0.0 && !m_opt.highFrequency)
+        throw std::runtime_error("timeDependent: excitationFrequency must be 0 (the field oscillation is resolved in "
+                                 "time through timeDependent.reducedField), or timeDependent.highFrequency true "
+                                 "(reducedField is the RMS envelope of the carrier).");
     if (m_ek.growthModelType == GrowthModelType::spatial &&
         m_ek.ionizationOperator.ionizationOperatorType != IonizationOperatorType::conservative)
         throw std::runtime_error("timeDependent: spatial growth is not available in the time-dependent mode; "
@@ -556,7 +569,8 @@ void TimeDependentBoltzmann::assembleFixedOperators()
                              ? "swarm"
                              : (m_opt.electronDensity == TimeDependentOptions::ElectronDensity::constant ? "constant"
                                                                                                          : "external"),
-                         m_ee ? ", e-e collisions on" : "", m_dynF1 ? ", dynamic f1" : ", quasi-static f1");
+                         m_ee ? ", e-e collisions on" : "", m_dynF1 ? ", dynamic f1" : ", quasi-static f1",
+                         m_WoN > 0.0 ? ", HF envelope (f = " + hfFrequencyText(m_WoN * m_N) + ")" : "");
 }
 
 double TimeDependentBoltzmann::fieldGrowthTerm(double c) const
@@ -579,7 +593,8 @@ void TimeDependentBoltzmann::evaluateField(double c)
     const double cEff = fieldGrowthTerm(c);
     if (!(cEff == m_Fc))
     {
-        m_ek.fieldOperator.evaluate(m_ek.grid(), m_ek.mixture.collision_data().totalCrossSection(), 1.0, 0.0, cEff, m_F);
+        m_ek.fieldOperator.evaluate(m_ek.grid(), m_ek.mixture.collision_data().totalCrossSection(), 1.0, m_WoN, cEff,
+                                    m_F);
         m_Fc = cEff;
     }
 }
@@ -938,7 +953,7 @@ Vector TimeDependentBoltzmann::steadyStateHF(const Vector &f0, double ErmsSI, do
         if (converged)
             break;
     }
-    m_Fc = std::numeric_limits<double>::quiet_NaN();  // m_F must be re-evaluated (WoN = 0)
+    m_Fc = std::numeric_limits<double>::quiet_NaN();  // m_F must be re-evaluated (at m_WoN)
     return f;
 }
 
@@ -965,12 +980,16 @@ double TimeDependentBoltzmann::reducedFieldSI(double t) const
 
 Vector TimeDependentBoltzmann::fieldCoefficientNodes(double c) const
 {
-    // as FieldOperator::evaluate (WoN = 0): g_j = (u_j/3)/Omega_j, Omega_j = sigma_c,j + cEff/(gamma sqrt(u_j))
+    // as FieldOperator::evaluate: g_j = (u_j/3)/Omega_j, Omega_j = Omega_c,j + (WoN/gamma)^2/(u_j Omega_c,j),
+    // Omega_c,j = sigma_c,j + cEff/(gamma sqrt(u_j)); WoN = m_WoN (0 unless highFrequency)
     const Vector &cs = m_ek.mixture.collision_data().totalCrossSection();
-    const double cEff = fieldGrowthTerm(c);
+    const double cEff = fieldGrowthTerm(c), w2 = m_WoN * m_WoN / (SI::gamma * SI::gamma);
     Vector g = Vector::Zero(m_n + 1);
     for (Grid::Index j = 1; j < m_n; ++j)
-        g[j] = (1. / 3.) * m_uNode[j] / (cs[j] + cEff / (SI::gamma * m_sqrtUNode[j]));
+    {
+        const double oc = cs[j] + cEff / (SI::gamma * m_sqrtUNode[j]);
+        g[j] = (1. / 3.) * m_uNode[j] / (oc + w2 / (m_uNode[j] * oc));
+    }
     return g;
 }
 
@@ -1387,7 +1406,7 @@ void TimeDependentBoltzmann::initializeImpl(const Vector *u0, const Vector *f00,
     m_ne = m_wc.electronDensity();
     double sa = 0, sw = 0, sphi = 0, soff = 0;
     const bool sinusoid = m_waveform->sinusoid(sa, sw, sphi, soff) && soff == 0.0;
-    const bool harmonicStart = m_dynF1 && sinusoid &&
+    const bool harmonicStart = m_dynF1 && sinusoid && m_WoN == 0.0 &&
                                (warm || (m_opt.initial == TimeDependentOptions::Initial::steadyState &&
                                          m_opt.initialReducedField == "rms"));
     if (harmonicStart && !warm)
@@ -1939,7 +1958,7 @@ void TimeDependentBoltzmann::writeCycleAverage(unsigned periods, double t0, doub
 void TimeDependentBoltzmann::prepareOutputState()
 {
     // the field operator (g) and e-e coefficients that LoKI-B's power evaluation uses, for m_ek.eedf and m_ek.CIEff
-    m_ek.fieldOperator.evaluate(m_ek.grid(), m_ek.mixture.collision_data().totalCrossSection(), 1.0, 0.0,
+    m_ek.fieldOperator.evaluate(m_ek.grid(), m_ek.mixture.collision_data().totalCrossSection(), 1.0, m_WoN,
                                 fieldGrowthTerm(m_ek.CIEff));
     if (m_ee)
         m_ek.eeOperator->update_g_ee_AB(m_ek.grid(), m_ek.eedf, m_ne, m_N);

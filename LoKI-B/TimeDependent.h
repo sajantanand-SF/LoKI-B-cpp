@@ -91,6 +91,16 @@ struct TimeDependentOptions
     enum class Anisotropy { quasiStatic, dynamic };
     Anisotropy anisotropy = Anisotropy::quasiStatic;
 
+    /** Time-dependent HF (cycle-averaged carrier): reducedField is the RMS envelope E_rms(t) of a carrier at
+     *  workingConditions.excitationFrequency, which is not resolved in time. Every field term takes LoKI-B's steady HF
+     *  form at fixed omega: Omega_c -> Omega_HF = Omega_c + omega^2/(N^2 gamma^2 u Omega_c) (FieldOperator, WoN), so
+     *  the heating is E_rms^2 g_HF and the steady state at a constant envelope is LoKI-B's steady HF solution. With
+     *  dynamic anisotropy f1 is the in-phase (power-carrying) amplitude, relaxing to -E_rms df/du / Omega_HF at
+     *  N gamma sqrt(u) Omega_HF. Valid when omega is well above the EEDF's energy relaxation rate and the envelope
+     *  changes over many carrier cycles. Off (default): excitationFrequency must be 0.
+     */
+    bool highFrequency = false;
+
     double finalTime = 0.0;  // required unless periodic
     std::vector<double> sampleTimes;
 
@@ -368,6 +378,7 @@ private:
     TimeDependentOptions m_opt;
     std::unique_ptr<Waveform> m_waveform;
     const double m_N;
+    double m_WoN = 0.0;  // omega/N (m^3/s) of the carrier with highFrequency, else 0
     Grid::Index m_n;
 
     Vector m_W;        // sqrt(u_k)/gamma
